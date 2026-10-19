@@ -1,0 +1,46 @@
+diff --git a/osfmk/arm/commpage/commpage_asm.s b/osfmk/arm/commpage/commpage_asm.s
+index da0bbba..b0be8a8 100644
+--- a/osfmk/arm/commpage/commpage_asm.s
++++ b/osfmk/arm/commpage/commpage_asm.s
+@@ -273,7 +273,20 @@ _pfz_trylock_and_enqueue:
+ 	mov		w11, #1			 // locked value = w11 = 1
+ 
+ 	// Try to grab the lock
++#if __ARM_FEATURE_ATOMICS
+ 	casa	w10, w11, [x3]	 // Atomic CAS with acquire barrier
++#else
++	/* ARMv8.0 (no LSE, e.g. onclite's Kryo 250): same trylock with an exclusive pair */
++81:
++	ldaxr	w10, [x3]		 // w10 = old value, acquire
++	cbnz	w10, 82f		 // held: fail with the old value, like casa
++	stxr	w12, w11, [x3]
++	cbnz	w12, 81b
++	b		83f
++82:
++	clrex
++83:
++#endif
+ 	cbz		w10, Ltrylock_enqueue_success
+ 
+ 	mov		x0, #-1			// Failed
+@@ -323,7 +336,20 @@ _pfz_trylock_and_dequeue:
+ 	mov		w10, wzr		 // unlock value = w10 = 0
+ 	mov		w11, #1			 // locked value = w11 = 1
+ 
++#if __ARM_FEATURE_ATOMICS
+ 	casa	w10, w11, [x2]	 // Atomic CAS with acquire barrier
++#else
++	/* ARMv8.0 (no LSE, e.g. onclite's Kryo 250): same trylock with an exclusive pair */
++91:
++	ldaxr	w10, [x2]		 // w10 = old value, acquire
++	cbnz	w10, 92f		 // held: fail with the old value, like casa
++	stxr	w12, w11, [x2]
++	cbnz	w12, 91b
++	b		93f
++92:
++	clrex
++93:
++#endif
+ 	cbz		w10, Ltrylock_dequeue_success
+ 
+ 	mov		x0, #-1			// Failed
