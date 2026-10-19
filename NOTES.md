@@ -193,6 +193,12 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   mapped (`not in trust cache` lines are informational, as on sweet) -> 157 execs in 5 min incl. logd, configd,
   keybagd, lockdownd, watchdogd, backboardd, SpringBoard; no CRASH lines, no panic; no ONCLITE LSE emulation logged.
   Ended by the reboot timer -> TWRP. Screen black (no display path yet).
+- **Display plan (user approved 2026-10-20: flash `boot` once display code is ready):** a normal LK boot keeps the
+  continuous splash (the panel is on); `fastboot boot` switches it off. 0107: AppleCLCD under ONCLITE uses a
+  1125x2436 BGRA shadow canvas at /onclite-panel (0xff400000, 12 MiB taken off xnu's RAM: ADT dram-size 0x6d400000)
+  as its panel + default surface, and after each present scales it (nearest neighbour, uniform 1520/2436 -> 702x1520
+  centered at x=9) into LK's splash, whose address/size/stride/byte order come from the MDP5 pipe LK left running
+  (SRC0_ADDR in 0x90000000-0x91400000, RGB888, SRC_UNPACK_PATTERN: 0 G, 1 B, 2 R per byte).
 - Root image on the Mac: `research/ios-root/ios16-root.img` (SHA256 6995911b...c073d verified after rsync);
   deleted on the server (its ~/ios-onclite-root keeps tools/src/log only).
 - **iOS ROOT IMAGE BUILT on the server (2026-10-19 18:44-18:50 UTC):** `~/ios-onclite-root/build-root.sh` (copy in the

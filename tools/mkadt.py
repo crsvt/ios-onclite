@@ -40,6 +40,11 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 # onclite (Redmi 7, SDM632). Kernel RAM: above the splash/ramoops 32MB block
 # (0x90000000) up to the end of DDR; every no-map carve-out is below 0x8f100000.
 ONC_PHYS_BASE, ONC_MEM_SIZE = 0x92000000, 0x6e000000
+# The top 12 MiB are not given to xnu: AppleCLCD's 1125x2436 BGRA canvas
+# (SweetFramebuffer.cpp), only ever mapped write-combined, scaled into the
+# 720x1520 RGB888 splash.
+ONC_PANEL_SIZE = 0xc00000
+ONC_PANEL_BASE = ONC_PHYS_BASE + ONC_MEM_SIZE - ONC_PANEL_SIZE
 ONC_GICD, ONC_GICD_SIZE = 0x0b000000, 0x1000     # qcom,msm-qgic2
 ONC_GICC, ONC_GICC_SIZE = 0x0b002000, 0x1000
 ONC_VTIMER_INTID = 20                            # DT timer: virtual = PPI 4
@@ -82,7 +87,7 @@ def build(seed=None, qemu=False, highmem=False, onclite=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     if onclite:
-        phys_base, mem_size = ONC_PHYS_BASE, ONC_MEM_SIZE
+        phys_base, mem_size = ONC_PHYS_BASE, ONC_MEM_SIZE - ONC_PANEL_SIZE
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -267,6 +272,7 @@ def build(seed=None, qemu=False, highmem=False, onclite=False):
         # then the vendor "core_mem"; absolute physical reg like /sweet-ufs).
         emmc = node('onclite-emmc', [ph(), ('compatible', cstr('qcom,sdhci-msm')),
                                      ('reg', u64(0x07824900, 0x500, 0x07824000, 0x800))])
+        panel = node('onclite-panel', [ph(), ('reg', u64(ONC_PANEL_BASE, ONC_PANEL_SIZE))])
         return node('device-tree', [
             ph(),
             ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,onclite') + cstr('qcom,sdm632') + cstr('AppleARM')),
@@ -276,7 +282,7 @@ def build(seed=None, qemu=False, highmem=False, onclite=False):
             ('manufacturer', cstr('Apple Inc.')),
             ('#address-cells', u32(2)),
             ('#size-cells', u32(2)),
-        ], [chosen, defaults, cpus, arm_io, ramoops, emmc, buttons] + product)
+        ], [chosen, defaults, cpus, arm_io, ramoops, emmc, panel, buttons] + product)
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product

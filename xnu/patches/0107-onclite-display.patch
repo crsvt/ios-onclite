@@ -1,0 +1,222 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..801ad63 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -29,6 +29,13 @@
+  * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
+  * enabled it, through the port they registered (IOConnectSetNotificationPort).
+  *
++ * onclite (Redmi 7): the splash is 720x1520 RGB888, so the 1125x2436 BGRA
++ * canvas is a shadow buffer (physical memory above xnu's RAM, ADT
++ * /onclite-panel) that present() composes into as on sweet; after each
++ * present the shadow is scaled (nearest neighbour, uniform, centered) and
++ * converted into the splash framebuffer. The splash pipe's address, size,
++ * stride and byte order are read from the MDP5 source pipe LK left running.
++ *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+@@ -50,6 +57,23 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#if defined(ONCLITE)
++#include <pexpert/device_tree.h>
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++
++/* MDP5 source pipes on SDM632 (DT qcom,mdss-pipe-{vig,rgb,dma}-off) */
++#define ONC_MDP_PA              0x01a00000UL
++#define ONC_MDP_SIZE            0x30000UL
++#define ONC_SSPP_SRC_SIZE       0x00
++#define ONC_SSPP_SRC0_ADDR      0x14
++#define ONC_SSPP_SRC_YSTRIDE0   0x24
++#define ONC_SSPP_SRC_FORMAT     0x30
++#define ONC_SSPP_UNPACK         0x34
++#define ONC_SPLASH_LO           0x90000000UL
++#define ONC_SPLASH_HI           0x91400000UL
++static const uint32_t onc_pipes[] = { 0x05000, 0x15000, 0x17000, 0x25000 };     /* VIG0 RGB0 RGB1 DMA0 */
++#endif
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -116,6 +140,17 @@ public:
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++#if defined(ONCLITE)
++	/* The real panel: LK's RGB888 splash, scaled into from the shadow canvas. */
++	uintptr_t     fPanel;
++	uint64_t      fPanelPhys;
++	uint32_t      fPanelW, fPanelH, fPanelStride;
++	uint32_t      fOutW, fOutH, fOutX, fOutY;      /* scaled canvas inside the panel */
++	uint8_t       fByteComp[3];   /* per byte: 0 = G, 1 = B, 2 = R (MDP5 unpack) */
++	uint32_t     *fMapX, *fMapY;  /* panel pixel -> canvas pixel */
++	bool panelSetup(void);
++	void panelCopy(void);
++#endif
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -126,6 +161,122 @@ public:
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++#if defined(ONCLITE)
++/*
++ * Shadow canvas (/onclite-panel reg) and the splash pipe LK scans out. The
++ * shadow is outside xnu's RAM, so it is only ever mapped write-combined.
++ */
++bool
++AppleCLCD::panelSetup(void)
++{
++	DTEntry node;
++	uint64_t const *reg = NULL;
++	unsigned int size = 0;
++	if (SecureDTLookupEntry(NULL, "/onclite-panel", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
++		IOLog("ONCLITE FB: no /onclite-panel in the device tree\n");
++		return false;
++	}
++	fPhys = reg[0];
++	fWidth = SWEET_FB_LOGICAL_W;
++	fHeight = SWEET_FB_LOGICAL_H;
++	fRowBytes = SWEET_FB_LOGICAL_W * 4;
++	if ((uint64_t)fRowBytes * fHeight > reg[1]) {
++		IOLog("ONCLITE FB: shadow region 0x%llx too small\n", reg[1]);
++		return false;
++	}
++
++	/* LK's splash pipe: address in the splash region, RGB888. Defaults: probe. */
++	fPanelPhys = 0x90001000UL;
++	fPanelW = 720;
++	fPanelH = 1520;
++	fPanelStride = 720 * 3;
++	uint32_t unpack = 0x00020001;   /* B, G, R in memory */
++	vm_offset_t mdp = ml_io_map(ONC_MDP_PA, ONC_MDP_SIZE);
++	for (unsigned int i = 0; mdp && i < sizeof(onc_pipes) / sizeof(onc_pipes[0]); i++) {
++		vm_offset_t pipe = mdp + onc_pipes[i];
++		uint32_t addr = *(volatile uint32_t *)(pipe + ONC_SSPP_SRC0_ADDR);
++		uint32_t sz = *(volatile uint32_t *)(pipe + ONC_SSPP_SRC_SIZE);
++		uint32_t fmt = *(volatile uint32_t *)(pipe + ONC_SSPP_SRC_FORMAT);
++		if (addr < ONC_SPLASH_LO || addr >= ONC_SPLASH_HI || ((fmt >> 9) & 3) + 1 != 3) {
++			continue;
++		}
++		fPanelPhys = addr;
++		fPanelW = sz & 0xffff;
++		fPanelH = sz >> 16;
++		fPanelStride = *(volatile uint32_t *)(pipe + ONC_SSPP_SRC_YSTRIDE0) & 0xffff;
++		unpack = *(volatile uint32_t *)(pipe + ONC_SSPP_UNPACK);
++		IOLog("ONCLITE FB: splash pipe 0x%x: 0x%x %ux%u stride %u format 0x%x unpack 0x%x\n",
++		    onc_pipes[i], addr, fPanelW, fPanelH, fPanelStride, fmt, unpack);
++		break;
++	}
++	if (fPanelW < 64 || fPanelH < 64 || fPanelStride < fPanelW * 3) {
++		IOLog("ONCLITE FB: no usable splash pipe\n");
++		return false;
++	}
++	for (int b = 0; b < 3; b++) {
++		fByteComp[b] = (uint8_t)((unpack >> (8 * b)) & 3);
++	}
++	fPanel = ml_io_map_wcomb((vm_offset_t)fPanelPhys, round_page((uint64_t)fPanelStride * fPanelH));
++	if (fPanel == 0) {
++		return false;
++	}
++
++	/* Uniform scale that fits the canvas, centered. */
++	if ((uint64_t)fPanelW * fHeight <= (uint64_t)fPanelH * fWidth) {
++		fOutW = fPanelW;
++		fOutH = (uint32_t)((uint64_t)fHeight * fPanelW / fWidth);
++	} else {
++		fOutH = fPanelH;
++		fOutW = (uint32_t)((uint64_t)fWidth * fPanelH / fHeight);
++	}
++	fOutX = (fPanelW - fOutW) / 2;
++	fOutY = (fPanelH - fOutH) / 2;
++	fMapX = (uint32_t *)IOMallocData(fOutW * sizeof(uint32_t));
++	fMapY = (uint32_t *)IOMallocData(fOutH * sizeof(uint32_t));
++	if (fMapX == NULL || fMapY == NULL) {
++		return false;
++	}
++	for (uint32_t x = 0; x < fOutW; x++) {
++		fMapX[x] = (uint32_t)(((uint64_t)x * fWidth + fWidth / 2) / fOutW);
++	}
++	for (uint32_t y = 0; y < fOutH; y++) {
++		fMapY[y] = (uint32_t)(((uint64_t)y * fHeight + fHeight / 2) / fOutH);
++	}
++	/* Black panel (LK's logo would stay around the scaled canvas). */
++	for (uint32_t y = 0; y < fPanelH; y++) {
++		volatile uint8_t *row = (volatile uint8_t *)(fPanel + (uint64_t)y * fPanelStride);
++		for (uint32_t x = 0; x < fPanelW * 3; x++) {
++			row[x] = 0;
++		}
++	}
++	IOLog("ONCLITE FB: canvas %ux%u at 0x%llx -> panel %ux%u at 0x%llx (%ux%u at %u,%u)\n",
++	    fWidth, fHeight, fPhys, fPanelW, fPanelH, fPanelPhys, fOutW, fOutH, fOutX, fOutY);
++	return true;
++}
++
++/* Scale and convert the BGRA canvas (memory B, G, R, A) into the panel. */
++void
++AppleCLCD::panelCopy(void)
++{
++	if (fPanel == 0 || fPixels == 0) {
++		return;
++	}
++	for (uint32_t y = 0; y < fOutH; y++) {
++		const volatile uint32_t *src = (const volatile uint32_t *)(fPixels + (uint64_t)fMapY[y] * fRowBytes);
++		volatile uint8_t *dst = (volatile uint8_t *)(fPanel + (uint64_t)(fOutY + y) * fPanelStride + fOutX * 3);
++		for (uint32_t x = 0; x < fOutW; x++) {
++			uint32_t p = src[fMapX[x]];
++			uint8_t c[3] = { (uint8_t)(p >> 8), (uint8_t)p, (uint8_t)(p >> 16) };  /* G, B, R */
++			dst[0] = c[fByteComp[0]];
++			dst[1] = c[fByteComp[1]];
++			dst[2] = c[fByteComp[2]];
++			dst += 3;
++		}
++	}
++}
++#endif /* ONCLITE */
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -157,11 +308,18 @@ AppleCLCD::start(IOService *provider)
+ 	if (!IOService::start(provider)) {
+ 		return false;
+ 	}
++#if defined(ONCLITE)
++	(void)video;
++	if (!panelSetup()) {
++		return false;
++	}
++#else
+ 	PE_current_console(&video);
+ 	fPhys = video.v_baseAddr;
+ 	fWidth = (uint32_t)video.v_width;
+ 	fHeight = (uint32_t)video.v_height;
+ 	fRowBytes = (uint32_t)video.v_rowBytes;
++#endif
+ 	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+@@ -238,6 +396,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+ 			}
++#if defined(ONCLITE)
++			fb->panelCopy();
++#endif
+ 		}
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+@@ -255,6 +416,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (rec != NULL) {
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++#if defined(ONCLITE)
++		fb->panelCopy();
++#endif
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
