@@ -16,7 +16,8 @@ on:
         description: make -k (collect all compile errors in one run)
         default: "true"
   push:
-    branches: [main]
+    # onclite-ci: the Redmi 7 port builds MACHINE_CONFIG=ONCLITE (main stays SWEET)
+    branches: [main, onclite-ci]
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
@@ -30,7 +31,7 @@ env:
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
-  MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || (github.ref == 'refs/heads/onclite-ci' && 'ONCLITE') || 'SWEET' }}
 
 jobs:
   build:

@@ -1,0 +1,393 @@
+diff --git a/osfmk/arm64/copyio.c b/osfmk/arm64/copyio.c
+index 15b949c..6dd87d7 100644
+--- a/osfmk/arm64/copyio.c
++++ b/osfmk/arm64/copyio.c
+@@ -306,6 +306,69 @@ copyout_atomic64(uint64_t value, user_addr_t user_addr)
+ 	return result;
+ }
+ 
++#if defined(ONCLITE)
++extern int _onclite_user_cas8(user_addr_t, uint64_t, uint64_t, uint64_t *);
++extern int _onclite_user_cas16(user_addr_t, uint64_t, uint64_t, uint64_t *);
++extern int _onclite_user_cas32(user_addr_t, uint64_t, uint64_t, uint64_t *);
++extern int _onclite_user_cas64(user_addr_t, uint64_t, uint64_t, uint64_t *);
++extern int _onclite_user_casp32(user_addr_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t *);
++extern int _onclite_user_casp64(user_addr_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t *);
++
++/*
++ * onclite: single-copy atomic operations on user memory for the EL0
++ * emulation of ARMv8.1 LSE instructions (osfmk/arm64/onclite_lse.c).
++ * size_log2 0-3 (byte to doubleword); operands are already truncated.
++ * Returns 0, EFAULT, or EINVAL for an unaligned address.
++ */
++int
++onclite_copy_cas(user_addr_t user_addr, unsigned int size_log2, uint64_t expected,
++    uint64_t desired, uint64_t *old)
++{
++	int result = copy_validate(user_addr, 0, 1UL << size_log2,
++	    COPYIO_OUT | COPYIO_ATOMIC | COPYIO_VALIDATE_USER_ONLY);
++	if (__improbable(result)) {
++		return result;
++	}
++	user_access_enable();
++	switch (size_log2) {
++	case 0:
++		result = _onclite_user_cas8(user_addr, expected, desired, old);
++		break;
++	case 1:
++		result = _onclite_user_cas16(user_addr, expected, desired, old);
++		break;
++	case 2:
++		result = _onclite_user_cas32(user_addr, expected, desired, old);
++		break;
++	default:
++		result = _onclite_user_cas64(user_addr, expected, desired, old);
++		break;
++	}
++	user_access_disable();
++	return result;
++}
++
++/* CASP: a pair of words (size_log2 2) or doublewords (3), naturally aligned as a pair. */
++int
++onclite_copy_casp(user_addr_t user_addr, unsigned int size_log2, const uint64_t expected[2],
++    const uint64_t desired[2], uint64_t old[2])
++{
++	int result = copy_validate(user_addr, 0, 2UL << size_log2,
++	    COPYIO_OUT | COPYIO_ATOMIC | COPYIO_VALIDATE_USER_ONLY);
++	if (__improbable(result)) {
++		return result;
++	}
++	user_access_enable();
++	if (size_log2 == 2) {
++		result = _onclite_user_casp32(user_addr, expected[0], expected[1], desired[0], desired[1], old);
++	} else {
++		result = _onclite_user_casp64(user_addr, expected[0], expected[1], desired[0], desired[1], old);
++	}
++	user_access_disable();
++	return result;
++}
++#endif /* ONCLITE */
++
+ int
+ copyinstr(const user_addr_t user_addr, char *kernel_addr, vm_size_t nbytes, vm_size_t *lencopied)
+ {
+diff --git a/osfmk/arm64/machine_routines_asm.s b/osfmk/arm64/machine_routines_asm.s
+index 2449334..00118b4 100644
+--- a/osfmk/arm64/machine_routines_asm.s
++++ b/osfmk/arm64/machine_routines_asm.s
+@@ -614,6 +614,89 @@ LEXT(_copyout_atomic64)
+ 	POP_FRAME
+ 	ARM64_STACK_EPILOG
+ 
++#if defined(ONCLITE)
++/*
++ * onclite: user-memory compare-and-swap for the EL0 emulation of ARMv8.1
++ * LSE atomics (osfmk/arm64/onclite_lse.c). Kryo 250 is ARMv8.0; the iOS 16
++ * userland executes CAS/LD<op>/SWP unconditionally in a few hundred places.
++ *
++ * int _onclite_user_cas{8,16,32,64}(user_addr_t addr, uint64_t expected,
++ *                                   uint64_t desired, uint64_t *old)
++ *	*old = the value read (zero-extended); memory = desired iff it was
++ *	expected. expected/desired are already truncated to the size.
++ * int _onclite_user_casp{32,64}(user_addr_t addr, uint64_t exp_lo, uint64_t exp_hi,
++ *                               uint64_t des_lo, uint64_t des_hi, uint64_t old[2])
++ *
++ * LDAXR/STLXR followed by DMB ISH is at least as strong as every CAS ordering
++ * variant. A page fault inside the range is resolved by the VM first and only
++ * an unresolvable one returns EFAULT; a fault between LDAXR and STLXR clears
++ * the monitor and the loop retries.
++ */
++.macro ONCLITE_USER_CAS name, ldx, stx, val, exp, des
++	.text
++	.align 2
++	.globl EXT(\name)
++LEXT(\name)
++	ARM64_STACK_PROLOG
++	PUSH_FRAME
++	COPYIO_RECOVER_RANGE 3f
++1:
++	\ldx	\val, [x0]
++	cmp		\val, \exp
++	b.ne	2f
++	\stx	w9, \des, [x0]
++	cbnz	w9, 1b
++	b		3f
++2:
++	clrex
++3:
++	dmb		ish
++	str		x8, [x3]
++	mov		x0, #0
++	POP_FRAME
++	ARM64_STACK_EPILOG
++.endmacro
++
++	ONCLITE_USER_CAS _onclite_user_cas8, ldaxrb, stlxrb, w8, w1, w2
++	ONCLITE_USER_CAS _onclite_user_cas16, ldaxrh, stlxrh, w8, w1, w2
++	ONCLITE_USER_CAS _onclite_user_cas32, ldaxr, stlxr, w8, w1, w2
++	ONCLITE_USER_CAS _onclite_user_cas64, ldaxr, stlxr, x8, x1, x2
++
++/*
++ * A pair read by LDAXP is single-copy atomic only together with a successful
++ * STLXP, so a mismatch writes the old pair back instead of CLREX.
++ */
++.macro ONCLITE_USER_CASP name, lo, hi, exp_lo, exp_hi, des_lo, des_hi
++	.text
++	.align 2
++	.globl EXT(\name)
++LEXT(\name)
++	ARM64_STACK_PROLOG
++	PUSH_FRAME
++	COPYIO_RECOVER_RANGE 3f
++1:
++	ldaxp	\lo, \hi, [x0]
++	cmp		\lo, \exp_lo
++	ccmp	\hi, \exp_hi, #0, eq
++	b.ne	2f
++	stlxp	w10, \des_lo, \des_hi, [x0]
++	cbnz	w10, 1b
++	b		3f
++2:
++	stlxp	w10, \lo, \hi, [x0]
++	cbnz	w10, 1b
++3:
++	dmb		ish
++	stp		x8, x9, [x5]
++	mov		x0, #0
++	POP_FRAME
++	ARM64_STACK_EPILOG
++.endmacro
++
++	ONCLITE_USER_CASP _onclite_user_casp32, w8, w9, w1, w2, w3, w4
++	ONCLITE_USER_CASP _onclite_user_casp64, x8, x9, x1, x2, x3, x4
++#endif /* ONCLITE */
++
+ 
+ /*
+  * int _bcopyout(const char *src, char *dst, vm_size_t len)
+diff --git a/osfmk/arm64/onclite_lse.c b/osfmk/arm64/onclite_lse.c
+new file mode 100644
+index 0000000..733fb46
+--- /dev/null
++++ b/osfmk/arm64/onclite_lse.c
+@@ -0,0 +1,179 @@
++/*
++ * onclite: EL0 emulation of the ARMv8.1 LSE atomics (and ARMv8.3 LDAPR).
++ *
++ * Kryo 250 is ARMv8.0. The iPhone X iOS 16 userland mostly selects its LSE
++ * code at run time ($VARIANT$armv81, from the commpage capabilities xnu
++ * derives from ID_AA64ISAR0), but about 400 instructions in libdispatch,
++ * libsystem_pthread, libsystem_platform, libsystem_malloc and a few
++ * frameworks use them unconditionally (NOTES.md, dyld cache scan). They
++ * arrive here as undefined instructions (ESR EC 0) and are emulated with
++ * the user-memory compare-and-swap in copyio.c. Every LD<op>/SWP is a
++ * compare-and-swap loop, which is as atomic as the instruction it replaces;
++ * the ordering is at least that of the acquire+release variants.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ONCLITE)
++#include <mach/arm/thread_status.h>
++#include <arm64/proc_reg.h>
++#include <kern/misc_protos.h>
++#include <pexpert/pexpert.h>
++#include <machine/atomic.h>
++#include <sys/errno.h>
++
++extern int onclite_copy_cas(user_addr_t user_addr, unsigned int size_log2, uint64_t expected,
++    uint64_t desired, uint64_t *old);
++extern int onclite_copy_casp(user_addr_t user_addr, unsigned int size_log2, const uint64_t expected[2],
++    const uint64_t desired[2], uint64_t old[2]);
++extern int copyin_atomic32(const user_addr_t user_addr, uint32_t *kernel_addr);
++extern int copyin_atomic64(const user_addr_t user_addr, uint64_t *kernel_addr);
++extern int proc_selfpid(void);
++
++boolean_t onclite_emulate_lse(arm_saved_state_t *state, uint32_t instr);
++
++static uint64_t _Atomic onclite_lse_count;
++
++/* Rs/Rt/Rs+1 as data: register 31 is XZR. */
++static uint64_t
++reg_or_zr(const arm_saved_state_t *state, unsigned int r)
++{
++	return r == 31 ? 0 : (uint64_t)get_saved_state_reg(state, r);
++}
++
++static void
++set_reg_or_zr(arm_saved_state_t *state, unsigned int r, uint64_t value)
++{
++	if (r != 31) {
++		set_saved_state_reg(state, r, (register_t)value);
++	}
++}
++
++static int64_t
++sext(uint64_t v, unsigned int size_log2)
++{
++	unsigned int shift = 64 - (8u << size_log2);
++	return (int64_t)(v << shift) >> shift;
++}
++
++static uint64_t
++lse_op(unsigned int opc, uint64_t cur, uint64_t v, unsigned int size_log2)
++{
++	switch (opc) {
++	case 0: return cur + v;                                         /* LDADD */
++	case 1: return cur & ~v;                                        /* LDCLR */
++	case 2: return cur ^ v;                                         /* LDEOR */
++	case 3: return cur | v;                                         /* LDSET */
++	case 4: return sext(cur, size_log2) > sext(v, size_log2) ? cur : v;  /* LDSMAX */
++	case 5: return sext(cur, size_log2) < sext(v, size_log2) ? cur : v;  /* LDSMIN */
++	case 6: return cur > v ? cur : v;                               /* LDUMAX */
++	default: return cur < v ? cur : v;                              /* LDUMIN */
++	}
++}
++
++/* LDAPR{B,H,}: the aligned word holding a byte or halfword is read atomically. */
++static int
++load_acquire(user_addr_t addr, unsigned int size_log2, uint64_t *out)
++{
++	int error;
++
++	if (size_log2 == 3) {
++		error = copyin_atomic64(addr, out);
++	} else if (addr & ((1u << size_log2) - 1)) {
++		error = EINVAL;
++	} else {
++		uint32_t word;
++		error = copyin_atomic32(addr & ~3ULL, &word);
++		if (!error) {
++			unsigned int shift = (unsigned int)(addr & 3) * 8;
++			uint64_t mask = size_log2 == 2 ? 0xffffffffULL : (1ULL << (8u << size_log2)) - 1;
++			*out = (word >> shift) & mask;
++		}
++	}
++	__builtin_arm_dmb(DMB_ISH);
++	return error;
++}
++
++/*
++ * Emulate one EL0 AArch64 instruction if it is an LSE atomic or LDAPR.
++ * Returns TRUE with the registers and PC updated; FALSE leaves everything
++ * unchanged (unknown instruction, unaligned or bad address) and the caller
++ * raises the usual EXC_BAD_INSTRUCTION.
++ */
++boolean_t
++onclite_emulate_lse(arm_saved_state_t *state, uint32_t instr)
++{
++	unsigned int rs = (instr >> 16) & 31, rn = (instr >> 5) & 31, rt = instr & 31;
++	unsigned int size = instr >> 30;
++	uint64_t mask = size == 3 ? ~0ULL : (1ULL << (8u << size)) - 1;
++	/* Rn is the base register: 31 is SP. */
++	user_addr_t addr = (user_addr_t)(rn == 31 ? get_saved_state_sp(state) : get_saved_state_reg(state, rn));
++	uint64_t cur, seen;
++
++	if ((instr & 0x3fa07c00) == 0x08a07c00) {
++		/* CAS{,A,L,AL}{B,H,}: Rs = expected in, old value out; Rt = new */
++		if (onclite_copy_cas(addr, size, reg_or_zr(state, rs) & mask,
++		    reg_or_zr(state, rt) & mask, &cur)) {
++			return FALSE;
++		}
++		set_reg_or_zr(state, rs, cur);
++	} else if ((instr & 0xbfa07c00) == 0x08207c00) {
++		/* CASP{,A,L,AL}: even register pairs Rs:Rs+1 and Rt:Rt+1 */
++		unsigned int psize = (instr & (1u << 30)) ? 3 : 2;
++		uint64_t pmask = psize == 3 ? ~0ULL : 0xffffffffULL;
++		uint64_t expected[2], desired[2], old[2];
++
++		if ((rs & 1) || (rt & 1)) {
++			return FALSE;
++		}
++		expected[0] = reg_or_zr(state, rs) & pmask;
++		expected[1] = reg_or_zr(state, rs + 1) & pmask;
++		desired[0] = reg_or_zr(state, rt) & pmask;
++		desired[1] = reg_or_zr(state, rt + 1) & pmask;
++		if (onclite_copy_casp(addr, psize, expected, desired, old)) {
++			return FALSE;
++		}
++		set_reg_or_zr(state, rs, old[0]);
++		set_reg_or_zr(state, rs + 1, old[1]);
++	} else if ((instr & 0x3f200c00) == 0x38200000) {
++		/* size 111 0 00 A R 1 Rs o3 opc 00 Rn Rt */
++		unsigned int o3 = (instr >> 15) & 1, opc = (instr >> 12) & 7;
++
++		if (o3 && opc == 4) {
++			/* LDAPR{B,H,}: Rs must be 31 */
++			if (rs != 31 || load_acquire(addr, size, &cur)) {
++				return FALSE;
++			}
++		} else if (o3 && opc != 0) {
++			return FALSE;
++		} else {
++			/* LD<op>/ST<op> (Rt = 31) and SWP: CAS loop from an atomic read */
++			uint64_t v = reg_or_zr(state, rs) & mask;
++			if (onclite_copy_cas(addr, size, 0, 0, &cur)) {
++				return FALSE;
++			}
++			for (;;) {
++				uint64_t next = o3 ? v : (lse_op(opc, cur, v, size) & mask);
++				if (onclite_copy_cas(addr, size, cur, next, &seen)) {
++					return FALSE;
++				}
++				if (seen == cur) {
++					break;
++				}
++				cur = seen;
++			}
++		}
++		/* Loaded value, zero-extended (W or X destination) */
++		set_reg_or_zr(state, rt, cur);
++	} else {
++		return FALSE;
++	}
++
++	add_saved_state_pc(state, 4);
++	uint64_t n = os_atomic_inc(&onclite_lse_count, relaxed);
++	if (n <= 8 || (n & (n - 1)) == 0) {
++		kprintf("ONCLITE LSE: emulated %llu instructions (pid %d, pc 0x%llx, instr 0x%08x)\n",
++		    n, proc_selfpid(), (uint64_t)get_saved_state_pc(state) - 4, instr);
++	}
++	return TRUE;
++}
++#endif /* ONCLITE */
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 1d9055d..08a51ed 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -150,6 +150,9 @@ static void handle_pac_fail(arm_saved_state_t *state, uint32_t esr) __dead2;
+ extern kern_return_t arm_fast_fault(pmap_t, vm_map_address_t, vm_prot_t, bool, bool);
+ 
+ static void handle_uncategorized(arm_saved_state_t *);
++#if defined(ONCLITE)
++boolean_t onclite_emulate_lse(arm_saved_state_t *state, uint32_t instr);
++#endif
+ 
+ /*
+  * For UBSan trap and continue handling, we must be able to recover
+@@ -889,6 +892,13 @@ handle_uncategorized(arm_saved_state_t *state)
+ 
+ 	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
+ 
++#if defined(ONCLITE)
++	/* ARMv8.0 Kryo 250: emulate the iOS userland's LSE atomics (onclite_lse.c). */
++	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) && onclite_emulate_lse(state, instr)) {
++		return;
++	}
++#endif
++
+ #if CONFIG_DTRACE
+ 
+ 	if (PSR64_IS_USER64(get_saved_state_cpsr(state))) {
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index b0dad49..37f0633 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -41,6 +41,7 @@ osfmk/arm/arm_timer.c		standard
+ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
++osfmk/arm64/onclite_lse.c		standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard

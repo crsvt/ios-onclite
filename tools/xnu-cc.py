@@ -21,6 +21,7 @@ Env: XNU_CC_CLANG   clang to use (default ~/swift/usr/bin/clang)
 import concurrent.futures as cf, os, re, shlex, subprocess, sys
 from collections import Counter
 
+# Runner checkout of darwin-xnu-build; read from the log (repo name varies: ios-sweet, ios-onclite)
 CI_DXB = '/Users/runner/work/ios-sweet/ios-sweet/dxb'
 CI_SDK_PLATFORM = re.compile(r'/Applications/Xcode[^ ]*?\.sdk/+System/Library/Frameworks/Kernel\.framework/Versions/A/PrivateHeaders/platform')
 CLANG = os.environ.get('XNU_CC_CLANG') or os.path.expanduser('~/swift/usr/bin/clang')
@@ -122,6 +123,13 @@ def run(item, bt, cdirs):
 
 def main():
     log, bt = sys.argv[1], os.path.abspath(sys.argv[2])
+    global CI_DXB
+    with open(log, errors='replace') as f:
+        for line in f:
+            m = re.search(r'(/Users/runner/work/[^/\s]+/[^/\s]+/dxb)/xnu/', line)
+            if m:
+                CI_DXB = m.group(1)
+                break
     per_file = '--per-file' in sys.argv
     filters = [a for a in sys.argv[3:] if a != '--per-file']
     cmds = commands(log)

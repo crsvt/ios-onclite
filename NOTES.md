@@ -95,6 +95,17 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   Local checks: run `.claude/scripts/sync-export-hdrs.sh xnu/out-buildtree` first (EXPORT_HDRS copies are stale
   otherwise and ONCLITE silently compiles as SWEET), then xnu-cc.py with
   XNU_CC_POST="-DARM64_BOARD_CONFIG_ONCLITE -march=armv8-a+crypto+crc -mcpu=cortex-a73".
+- **Patch series** `xnu/patches/0100-0103-onclite-*.patch` (apply after sweet 0081; verified with git apply on a clean
+  baseline = the compile-checked tree): 0100 machine config (MakeInc.def ONCLITE, MASTER.arm64.onclite, ONCLITE.h,
+  board_config.h, Makefile.templates), 0101 GICv2 + gold cluster (pe_fiq.c, protos.h, sleh.c IRQ, SweetCPU.cpp,
+  KernelConfigTables.cpp), 0102 ramoops console (sweet_early.c/.h, start.s, arm_vm_init.c, pe_serial.c),
+  0103 LSE emulation (onclite_lse.c, copyio.c onclite_copy_cas/casp, machine_routines_asm.s _onclite_user_cas*,
+  files.arm64, sleh.c handle_uncategorized hook). Regenerate with `.claude/scripts/export-onclite-patches.sh`
+  (build-tree branch main = baseline + WIP commits). LSE emulator host test `onclite/test/lse/` (native JIT vs
+  emulator on Apple silicon): 300000 random CAS/CASP/LD<op>/SWP/LDAPR cases, 0 failures; planted bugs are caught.
+- Not done yet: xnu reboot via PS_HOLD (panic just stops; warm-reset by hand), display (Phase 3), eMMC root.
+- CI: `.github/workflows/xnu.yml` also triggers on branch `onclite-ci` with MACHINE_CONFIG=ONCLITE
+  (-> kernel.development.onclite). crsvt/ios-onclite is PUBLIC: check pushes for serials/IMEI/calibration first.
 
 ## Agent handoff / active work (2026-10-15, latest)
 

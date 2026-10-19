@@ -1,0 +1,360 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..ef09db1 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -1,5 +1,6 @@
+ /*
+  * A55 SMP bring-up for sweet using XNU's legacy IOCPU interface and PSCI.
++ * onclite: the four Kryo 250 Gold cores (MPIDR 0x100-0x103), GICv2 SGIs.
+  * The architected timer and SGI1 already enter through pe_fiq/sleh_irq.
+  * CPU_OFF, suspend and the A76 cores still require separate platform work.
+  */
+@@ -20,6 +21,10 @@
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++#if defined(ONCLITE)
++extern "C" void sweet_gic_send_sgi(unsigned int cpu, unsigned int sgi);
++extern "C" boolean_t sweet_gic_cpu_ready(unsigned int cpu);
++#endif
+ 
+ class SweetCPU;
+ static SweetCPU *sweet_cpus[MAX_CPUS];
+@@ -73,16 +78,26 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
++#if defined(ONCLITE)
++	/* Gold cluster only: MPIDR Aff1 = 1 (cluster), Aff0 = 0-3 (core) */
++	if ((cpu->phys_id & ~0x3U) != ONCLITE_BOOT_MPIDR ||
++	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++#else
+ 	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+ 	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++#endif
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
++#if defined(ONCLITE)
++	cpuName = OSSymbol::withCStringNoCopy("Kryo 250 Gold");
++#else
+ 	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
++#endif
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+@@ -144,10 +159,17 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		}
+ 		IOSleep(1);
+ 	}
++#if defined(ONCLITE)
++	/* The shim starts xnu on the first Gold core; the ADT lists it first. */
++	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != ONCLITE_BOOT_MPIDR) {
++		panic("SWEET CPU: expected boot MPIDR 0x%x and logical CPU 0", ONCLITE_BOOT_MPIDR);
++	}
++#else
+ 	/* The supplied ADT has cpu0 as the boot CPU and ascending A55 nodes. */
+ 	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
+ 		panic("SWEET CPU: expected boot MPIDR 0 and logical CPU 0");
+ 	}
++#endif
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
+@@ -157,6 +179,9 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 		/* processor_start() is asynchronous for secondaries in this XNU. */
+ 		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
++#if defined(ONCLITE)
++		    !sweet_gic_cpu_ready(i) ||
++#endif
+ 		    !sweet_cpu_signal_is_enabled(i)) {
+ 			if (mach_absolute_time() > deadline) {
+ 				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+@@ -214,6 +239,10 @@ SweetCPU::signalCPU(IOCPU *target)
+ 	if (logical >= topology->num_cpus) {
+ 		panic("SWEET CPU: invalid SGI target %u", logical);
+ 	}
++#if defined(ONCLITE)
++	/* GICv2: GICD_SGIR with the target's CPU interface bit (pe_fiq.c). */
++	sweet_gic_send_sgi(logical, SWEET_IPI_SGI);
++#else
+ 	/* Use the TARGET affinity, including Aff1, never the sender's MPIDR. */
+ 	uint64_t mpidr = topology->cpus[logical].phys_id;
+ 	unsigned int aff0 = mpidr & 0xff;
+@@ -226,6 +255,7 @@ SweetCPU::signalCPU(IOCPU *target)
+ 	    ((uint64_t)SWEET_IPI_SGI << 24) | (1ULL << aff0);
+ 	__builtin_arm_dsb(DSB_ISHST);
+ 	__builtin_arm_wsr64("ICC_SGI1R_EL1", sgi);
++#endif
+ 	__builtin_arm_isb(ISB_SY);
+ }
+ 
+@@ -234,7 +264,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ {
+ 	const ml_topology_cpu_t *cpu = &ml_get_topology_info()->cpus[getCPUNumber()];
+ 	/* cpu_start() passes NULL,NULL: x20/x21 are set by LowResetVectorBase. */
+-	if (start_paddr != 0 || arg_paddr != 0 || cpu->phys_id == 0 ||
++	if (start_paddr != 0 || arg_paddr != 0 || cpu == ml_get_topology_info()->boot_cpu ||
+ 	    __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) != 0) {
+ 		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..2e952f6 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -38,13 +38,21 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = SweetPlatformExpert;"
+     "     'IOProviderClass' = IOPlatformExpertDevice;"
++#if defined(ARM64_BOARD_CONFIG_ONCLITE)
++    "     'IONameMatch'     = 'xiaomi,onclite';"
++#else
+     "     'IONameMatch'     = 'xiaomi,sweet';"
++#endif
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
+     "     'IOClass'         = SweetCPU;"
+     "     'IOProviderClass' = IOPlatformDevice;"
++#if defined(ARM64_BOARD_CONFIG_ONCLITE)
++    "     'IONameMatch'     = 'qcom,kryo250';"
++#else
+     "     'IONameMatch'     = 'qcom,kryo470';"
++#endif
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 24f1abc..1d9055d 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1861,8 +1861,16 @@ sleh_irq(arm_saved_state_t *state)
+ 	 * sweet: TrustZone owns GIC Group 0, so the timer and IPIs that other
+ 	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
+ 	 */
++#if defined(ONCLITE)
++	/* GICv2: memory-mapped CPU interface; EOIR takes the whole IAR (SGI source CPU). */
++	uint32_t iar = sweet_gic_ack();
++	uint32_t intid = iar & GICC_IAR_INTID_MASK;
++#define SWEET_GIC_EOI(iar) sweet_gic_eoi(iar)
++#else
+ 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
++#define SWEET_GIC_EOI(iar) __builtin_arm_wsr64("ICC_EOIR1_EL1", (iar))
++#endif
+ 
+ 	if (intid >= 1020 && intid <= 1023) {
+ 		return; /* spurious */
+@@ -1873,11 +1881,11 @@ sleh_irq(arm_saved_state_t *state)
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
+ 		INTERRUPT_MASKED_DEBUG_END();
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		SWEET_GIC_EOI(iar);
+ 	} else if (intid < 16) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		SWEET_GIC_EOI(iar);
+ 		__builtin_arm_isb(ISB_SY);
+ 		cpu_signal_handler();
+ 	} else {
+@@ -1888,7 +1896,7 @@ sleh_irq(arm_saved_state_t *state)
+ 			    cdp->interrupt_nub,
+ 			    intid);
+ 		}
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		SWEET_GIC_EOI(iar);
+ 	}
+ 	__builtin_arm_isb(ISB_SY);
+ #else
+@@ -1903,6 +1911,7 @@ sleh_irq(arm_saved_state_t *state)
+ 	    cdp->interrupt_nub,
+ 	    cdp->interrupt_source);
+ #endif
++#undef SWEET_GIC_EOI
+ #endif /* SWEET */
+ 
+ 	entropy_collect();
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 6089db9..043eea1 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -222,6 +222,154 @@ pe_init_fiq()
+ 	__builtin_arm_isb(ISB_SY);
+ #endif /* SWEET */
+ }
++#elif HAS_GIC_V2
++/*
++ * onclite: GICv2 (QGIC2) with security extensions. TrustZone owns Group 0;
++ * the timer and SGIs are Group 1 non-secure and arrive as IRQs (sleh_irq).
++ * The CPU interface is memory-mapped and banked per core; it starts
++ * disabled on every core the shim or PSCI CPU_ON brings up.
++ */
++SECURITY_READ_ONLY_LATE(uint32_t) sweet_vtimer_intid = SWEET_VTIMER_INTID;
++
++static vm_offset_t gicd_base;
++static vm_offset_t gicc_base;
++
++/* GICv2 CPU interface number of each logical CPU (one bit of GICD_ITARGETSR). */
++static uint8_t gic_cpu_iface_mask[MAX_CPUS];
++
++static uint32_t
++_gic_read32(vm_offset_t addr)
++{
++	return *((volatile uint32_t *) addr);
++}
++
++static void
++_gic_write32(vm_offset_t addr, uint32_t value)
++{
++	*((volatile uint32_t *) addr) = value;
++}
++
++static void
++_gic_write8(vm_offset_t addr, uint8_t value)
++{
++	*((volatile uint8_t *) addr) = value;
++}
++
++#define gicd_read32(offset) (_gic_read32(gicd_base + (offset)))
++#define gicd_write32(offset, data) (_gic_write32(gicd_base + (offset), (data)))
++#define gicc_read32(offset) (_gic_read32(gicc_base + (offset)))
++#define gicc_write32(offset, data) (_gic_write32(gicc_base + (offset), (data)))
++
++void
++pe_init_fiq()
++{
++	int error;
++	DTEntry entry;
++
++	// gicd_base is 0x0 only before it's initialized by the boot processor.
++	// Avoid calling SecureDT* routines on secondary processors to avoid
++	// race conditions because they are not thread-safe.
++	if (!gicd_base) {
++		error = SecureDTLookupEntry(NULL, "/arm-io/gic", &entry);
++		if (error != kSuccess) {
++			panic("%s: cannot find GIC node in DT", __func__);
++		}
++
++		// reg = <GICD base, GICD size, GICC base, GICC size>
++		void const *prop;
++		unsigned int prop_size;
++		error = SecureDTGetProperty(entry, "reg", &prop, &prop_size);
++		if (error != kSuccess) {
++			panic("%s: cannot find GIC MMIO regions in DT", __func__);
++		}
++		if (prop_size < 4 * sizeof(uint64_t)) {
++			panic("%s: incorrect reg property size in GIC DT node; expecting 32 bytes but got %u bytes", __func__, prop_size);
++		}
++
++		void const *timer_prop;
++		unsigned int timer_size;
++		if (SecureDTGetProperty(entry, "virtual-timer-intid", &timer_prop, &timer_size) == kSuccess) {
++			if (timer_size != sizeof(uint32_t)) {
++				panic("%s: invalid virtual-timer-intid size %u", __func__, timer_size);
++			}
++			uint32_t intid = *(const uint32_t *)timer_prop;
++			if (intid < 16 || intid >= 32) {
++				panic("%s: virtual timer INTID %u is not a PPI", __func__, intid);
++			}
++			sweet_vtimer_intid = intid;
++		}
++
++		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
++		uint64_t const *reg = (uint64_t const *) prop;
++
++		gicd_base = ml_io_map(soc_base_phys + reg[0], reg[1]);
++		if (!gicd_base) {
++			panic("%s: cannot map GICD region", __func__);
++		}
++		gicc_base = ml_io_map(soc_base_phys + reg[2], reg[3]);
++		if (!gicc_base) {
++			panic("%s: cannot map GICC region", __func__);
++		}
++		kprintf("ONCLITE GIC: GICv2 typer=0x%x virtual timer INTID %u\n",
++		    gicd_read32(GICD_TYPER), sweet_vtimer_intid);
++	}
++
++	/*
++	 * Banked per core: GICD_ITARGETSR0..7 (SGIs) read as this core's own
++	 * CPU interface bit. That is the target list for SGIs to this core.
++	 */
++	uint32_t self = gicd_read32(GICD_ITARGETSR) & 0xff;
++	if (self == 0 || (self & (self - 1)) != 0) {
++		panic("%s: core %u has no single GIC CPU interface (ITARGETSR0=0x%x)",
++		    __func__, ml_get_cpu_number_local(), self);
++	}
++	os_atomic_store(&gic_cpu_iface_mask[ml_get_cpu_number_local()], (uint8_t)self, release);
++
++	/* SGIs and PPIs (INTID 0-31) are banked: priority and enable per core. */
++	for (unsigned int i = 0; i < 32; i++) {
++		_gic_write8(gicd_base + GICD_IPRIORITYR + i, 0xa0);
++	}
++	gicd_write32(GICD_ICENABLER0, 0xffffffff & ~((1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI)));
++	gicd_write32(GICD_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++
++	gicc_write32(GICC_PMR, 0xff);
++	gicc_write32(GICC_BPR, 0);
++	gicc_write32(GICC_CTLR, gicc_read32(GICC_CTLR) | GICC_CTLR_ENABLEGRP1);
++	gicd_write32(GICD_CTLR, gicd_read32(GICD_CTLR) | GICD_CTLR_ENABLEGRP1);
++	__builtin_arm_dsb(DSB_SY);
++	__builtin_arm_isb(ISB_SY);
++}
++
++/* sleh_irq: acknowledge (GICC_IAR) and complete (GICC_EOIR) one interrupt. */
++uint32_t
++sweet_gic_ack(void)
++{
++	return gicc_read32(GICC_IAR);
++}
++
++void
++sweet_gic_eoi(uint32_t iar)
++{
++	gicc_write32(GICC_EOIR, iar);
++}
++
++/* SGI to one logical CPU, through its GICv2 CPU interface bit. */
++void
++sweet_gic_send_sgi(unsigned int cpu, unsigned int sgi)
++{
++	if (cpu >= MAX_CPUS || gic_cpu_iface_mask[cpu] == 0) {
++		panic("%s: cpu %u has no known GIC CPU interface", __func__, cpu);
++	}
++	__builtin_arm_dsb(DSB_ISHST);
++	gicd_write32(GICD_SGIR, ((uint32_t)gic_cpu_iface_mask[cpu] << GICD_SGIR_TARGET_SHIFT) | (sgi & 0xf));
++}
++
++/* SweetCPU::startAll: the target has run pe_init_fiq (its interface is known). */
++boolean_t
++sweet_gic_cpu_ready(unsigned int cpu)
++{
++	return cpu < MAX_CPUS && os_atomic_load(&gic_cpu_iface_mask[cpu], acquire) != 0;
++}
+ #else
+ void
+ pe_init_fiq()
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index 9004f2b..6f0b8d8 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -39,6 +39,13 @@ void pe_init_fiq(void);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern uint32_t sweet_vtimer_intid;
+ #endif
++#if defined(ARM64_BOARD_CONFIG_ONCLITE)
++/* GICv2 CPU interface helpers (pexpert/arm/pe_fiq.c) */
++uint32_t sweet_gic_ack(void);
++void sweet_gic_eoi(uint32_t iar);
++void sweet_gic_send_sgi(unsigned int cpu, unsigned int sgi);
++boolean_t sweet_gic_cpu_ready(unsigned int cpu);
++#endif
+ 
+ #ifdef PRIVATE
+ /**
