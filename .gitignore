@@ -12,3 +12,5 @@ __pycache__/
 .claude/
 onclite/probe/out/
 logs/
+onclite/out/
+onclite/shim/out/

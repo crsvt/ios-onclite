@@ -3,6 +3,8 @@
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
 address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+--onclite: the Redmi 7 (SDM632) tree for the ONCLITE kernel instead (live FDT
+and probe results in NOTES.md): Gold cluster only, GICv2, ramoops console.
 """
 import hashlib, os, struct, sys
 
@@ -34,6 +36,14 @@ QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
+
+# onclite (Redmi 7, SDM632). Kernel RAM: above the splash/ramoops 32MB block
+# (0x90000000) up to the end of DDR; every no-map carve-out is below 0x8f100000.
+ONC_PHYS_BASE, ONC_MEM_SIZE = 0x92000000, 0x6e000000
+ONC_GICD, ONC_GICD_SIZE = 0x0b000000, 0x1000     # qcom,msm-qgic2
+ONC_GICC, ONC_GICC_SIZE = 0x0b002000, 0x1000
+ONC_VTIMER_INTID = 20                            # DT timer: virtual = PPI 4
+ONC_ECID = 0x4f4e434c49544501                    # 'ONCLITE' + 1, synthetic
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
@@ -68,9 +78,11 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
+def build(seed=None, qemu=False, highmem=False, onclite=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    if onclite:
+        phys_base, mem_size = ONC_PHYS_BASE, ONC_MEM_SIZE
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -82,8 +94,8 @@ def build(seed=None, qemu=False, highmem=False):
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),
         ('debug-enabled', u32(1)),
-        ('firmware-version', cstr('sweet-shim')),
-        ('system-firmware-version', cstr('sweet-shim')),
+        ('firmware-version', cstr('onclite-shim' if onclite else 'sweet-shim')),
+        ('system-firmware-version', cstr('onclite-shim' if onclite else 'sweet-shim')),
         # iBoot's SHA-384 of the boot manifest; /sbin/mount -P 1 exits unless
         # it exists (bind mounts /private/preboot/<hex>/usr/standalone/firmware,
         # tolerating a missing directory). Fixed stand-in value.
@@ -101,7 +113,7 @@ def build(seed=None, qemu=False, highmem=False):
         # files), so e.g. DataMigration never records LastSystemVersion and
         # migrates on every boot. Synthetic ECID (not the phone's); chip-id
         # of the A11 that the iPhone X userland expects.
-        ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
+        ('unique-chip-id', struct.pack('<Q', ONC_ECID if onclite else SWEET_ECID)),
         ('chip-id', u32(0x8015)),
         # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
@@ -145,6 +157,31 @@ def build(seed=None, qemu=False, highmem=False):
             ('peripheral-frequency', u32(timebase)),
             ('fixed-frequency', u32(timebase)),
         ]))
+    if onclite:
+        # Kryo 250 Gold only (the Silver cores lack the 16K granule); the shim
+        # starts xnu on MPIDR 0x100, listed first so it is logical CPU 0.
+        cpu_nodes = []
+        for core in range(4):
+            cpu_nodes.append(node(f'cpu{core}', [
+                ph(),
+                ('device_type', cstr('cpu')),
+                ('compatible', cstr('qcom,kryo250') + cstr('ARM,v8')),
+                ('reg', u32(0x100 | core)),  # MPIDR Aff1 = 1 (Gold cluster), Aff0 = core
+                ('cpu-id', u32(core)),
+                ('cluster-id', u32(0)),
+                ('cluster-type', u32(0)),
+                ('die-cluster-id', u32(0)),
+                ('cluster-core-id', u32(core)),
+                ('l2-cache-id', u32(1)),     # one L2 for the Gold cluster
+                ('l3-cache-id', u32(0)),
+                ('state', cstr('running' if core == 0 else 'stopped')),
+                ('timebase-frequency', u32(TIMEBASE)),
+                ('clock-frequency', u32(1804800000)),
+                ('bus-frequency', u32(100000000)),
+                ('memory-frequency', u32(933000000)),
+                ('peripheral-frequency', u32(TIMEBASE)),
+                ('fixed-frequency', u32(TIMEBASE)),
+            ]))
     cpus = node('cpus', [ph(), ('#address-cells', u32(1)),
                          ('#size-cells', u32(0))], cpu_nodes)
 
@@ -155,6 +192,15 @@ def build(seed=None, qemu=False, highmem=False):
         ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
         ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
     ])
+    if onclite:
+        # GICv2 (pe_fiq.c HAS_GIC_V2): reg = <GICD size GICC size>, arm-io relative
+        gic = node('gic', [
+            ph(),
+            ('compatible', cstr('arm,gic-400')),
+            ('interrupt-controller', b''),
+            ('virtual-timer-intid', u32(ONC_VTIMER_INTID)),
+            ('reg', u64(ONC_GICD - SOC_BASE, ONC_GICD_SIZE, ONC_GICC - SOC_BASE, ONC_GICC_SIZE)),
+        ])
     arm_io = node('arm-io', [
         ph(),
         ('device_type', cstr('sweet-io')),
@@ -212,6 +258,22 @@ def build(seed=None, qemu=False, highmem=False):
     product_props = d22ap_product()
     product = [node('product', [ph()] + product_props)] if product_props else []
 
+    if onclite:
+        # Console into the ramoops console zone (pe_serial.c, sweet_early.c); the
+        # zone is fixed in the kernel, the node only enables it. No fbcon (LK
+        # switches the panel off for fastboot boot), no UFS (eMMC phone).
+        ramoops = node('sweet-ramoops', [ph(), ('reg', u64(0x91400000, 0x200000))])
+        return node('device-tree', [
+            ph(),
+            ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,onclite') + cstr('qcom,sdm632') + cstr('AppleARM')),
+            ('model', cstr('iPhone10,3')),
+            ('target-type', cstr('D22')),
+            ('target-sub-type', cstr('D22AP')),
+            ('manufacturer', cstr('Apple Inc.')),
+            ('#address-cells', u32(2)),
+            ('#size-cells', u32(2)),
+        ], [chosen, defaults, cpus, arm_io, ramoops, buttons] + product)
+
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
@@ -228,7 +290,7 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, onclite='--onclite' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

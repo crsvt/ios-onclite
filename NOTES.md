@@ -74,7 +74,27 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
 - Local XNU compile checks: CI run 39158169212 (dipa-studio/ios-sweet @ fdad0de) build tree in `xnu/out-buildtree/`
   (+ `ci.log`), its kernel in `xnu/out-sweet/`. `XNU_CC_CLANG=/usr/bin/clang python3 tools/xnu-cc.py
   xnu/out-buildtree/ci.log xnu/out-buildtree FILE` works with the Command Line Tools clang (no ~/swift needed).
-  A full kernel build needs Xcode 15 + a KDK (Apple ID) or GitHub Actions (needs a push; user said do not push).
+  A full kernel build needs Xcode 15 + a KDK (Apple ID) or GitHub Actions (needs a push). User then chose: push an
+  onclite branch only for CI; main stays local.
+- **Shim** `onclite/shim/` (start.S, shim.c, shim.ld, build.sh PAYLOAD -> out/onclite-boot.img): finds the
+  SWEETXNU payload in the LK initrd, copies segments to phys_base, ADT + boot_args behind the kernel (no boot video),
+  CPU_ON(0x100, entry_pa, boot_args_pa), then cpu0 CPU_OFF; logs to ramoops. ADT: `tools/mkadt.py OUT --onclite`
+  (RAM 0x92000000+0x6e000000, GICv2, 4 gold cpus 0x100-0x103, `sweet-ramoops`; sweet output unchanged, verified).
+  Test with a stand-in kernel (`onclite/shim/test/build-stub.sh`, PAD_MB): 1 MB payload -> full path works on the
+  device (`logs/shim-stub-2.txt`): stub on MPIDR 0x100, EL1, SCTLR 0xc00800, x0 = boot_args, physBase/memSize/ADT/
+  cmdline correct. LK IGNORES the header ramdisk_addr: initrd at 0x43600000 (right after the DTB at 0x43400000) for
+  both 0x81000000 and 0x44000000. An 84 MB payload made `fastboot boot` fail ("Booting FAILED usb_read") and hang:
+  keep payloads small (kernel ~17 MB; root on eMMC later). PSCI SYSTEM_RESET from the gold core after cpu0 CPU_OFF
+  did NOT reset (stub hung); the probes reset because they also drop PS_HOLD (0x004ab000) -> xnu reboot needs that.
+  After a hang: Power + Volume down ~15 s (warm reset, RAM kept) -> fastboot -> `fastboot reboot` -> Lineage, read pstore.
+  Do not boot recovery in between: every Linux boot replaces the record.
+- XNU onclite patches in progress in `xnu/out-buildtree/xnu` (git; baseline = sweet 0001-0081): ONCLITE machine
+  config (-mcpu=cortex-a73: Darwin clang otherwise defaults to an Apple CPU and emits LSE even with -march=armv8-a),
+  GICv2 (pe_fiq.c HAS_GIC_V2, sleh.c, SweetCPU.cpp), gold-cluster SMP, ramoops console (sweet_early.c,
+  pe_serial.c `sweet-ramoops`, start.s/arm_vm_init block 0x90000000), IOKit names xiaomi,onclite / qcom,kryo250.
+  Local checks: run `.claude/scripts/sync-export-hdrs.sh xnu/out-buildtree` first (EXPORT_HDRS copies are stale
+  otherwise and ONCLITE silently compiles as SWEET), then xnu-cc.py with
+  XNU_CC_POST="-DARM64_BOARD_CONFIG_ONCLITE -march=armv8-a+crypto+crc -mcpu=cortex-a73".
 
 ## Agent handoff / active work (2026-10-15, latest)
 

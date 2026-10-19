@@ -13,6 +13,8 @@ p.add_argument('--like', required=True)
 p.add_argument('--kernel', required=True)
 p.add_argument('--ramdisk', required=True)
 p.add_argument('--cmdline')
+p.add_argument('--ramdisk-addr', type=lambda v: int(v, 0),
+	       help='load address of the ramdisk (default: the stock one)')
 p.add_argument('-o', '--out', required=True)
 a = p.parse_args()
 
@@ -20,6 +22,8 @@ stock = open(a.like, 'rb').read(4096)
 assert stock[:8] == b'ANDROID!'
 (_, kaddr, _, raddr, _, saddr, taddr, page, ver, osv) = struct.unpack_from('<10I', stock, 8)
 assert ver == 1, f'stock header version {ver}, expected 1'
+if a.ramdisk_addr is not None:
+	raddr = a.ramdisk_addr
 name = stock[48:64]
 cmd = a.cmdline.encode() if a.cmdline is not None else stock[64:64 + 512].split(b'\0')[0]
 extra = b''
