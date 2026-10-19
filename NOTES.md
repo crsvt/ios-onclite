@@ -221,7 +221,18 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   daemons at 10 min (tccd, findmydeviced, bluetoothd, datamigrator, ...), identityservicesd burning CPU (75 %), no
   crash except driverkitd sig 9. The sampler printed NOTHING (no `SMP --- sample 0`, which should come 90 s after the
   root): its tsleep(90*hz) never returns? Not investigated yet.
-- **E6 (no timer, 03:26 IST):** running so the user can watch for the home screen.
+- **E6 (no timer, 03:26 IST):** Apple logo, no change for ~30 min; manual reset -> log cut at line 548 again.
+- **F1 (kernel out-onclite-15 = CI 39333857346: touch + 20 Hz vsync + sampler fix, 900 s timer, 04:02 IST,
+  `logs/xnu-f1-touch.txt`, complete):** vsync 50000 us, logo after ~6 min (6 swaps), sampler works (samples 0-6).
+  **SpringBoard main thread stuck** (same stack in samples 5 and 6): -[CCSModuleRepository
+  _initWithDirectoryURLs:...] -> LSApplicationRecord init -> _LSContextInitCommon -> os_unfair_lock; thread 1 holds
+  it in `___LAUNCH_SERVICES_IS_RESEEDING_ITS_DATABASE_AND_MAY_BLOCK__` (sync NSXPC to lsd). lsd rebuilds the
+  LaunchServices database; every run so far ended before it finished, so it restarts each boot (guess).
+  Symbolicate: `~/.claude/tools/ipsw-cli/ipsw dyld a2s research/ipsw-x/dyld/20H392__iPhone10,3_6/dyld_shared_cache_arm64
+  <addr - slide>`. **Touch:** clocks/QUP OK (QUP 0x20070000, FIFOs 64/64 bytes) but 0x38 NACKs (i2c status
+  0x0d1300c8, err ENXIO) -> L10 power suspected. Before: GPIO64 reset was output LOW (cfg 0x2c0), GPIO10/11 func 0.
+- **F2 (04:23 IST, kernel 15, 2700 s timer, sweetsample=SpringBoard,lsd,installd):** let lsd finish once.
+- CI 964ade0 (building): read-only PM8953 L6/L10 report at boot (`ONCLITE: PMIC L10 ... -> ON/OFF`).
 - **0108 touch (`bsd/dev/onclite_touch.c`, CI 39332051381):** FT5446 @0x38 on BLSP1 QUP3 0x78b7000, polled FIFO
   transfers with V2 tags, GCC BLSP1 AHB vote + QUP3 RCG XO/1 + CBCR, GPIO10/11 func 2, reset GPIO64, chip ID
   0xA3/0x9F, report reg 0x00 every 10 ms, panel 720x1520 -> canvas -> sweet 1080x2400 coordinates for
