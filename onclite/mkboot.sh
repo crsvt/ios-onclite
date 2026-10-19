@@ -11,7 +11,9 @@ K=${1:?kernel}; NAME=${2:?name}; shift 2
 RD=
 if [ $# -gt 0 ] && [ "$1" != "--" ]; then RD=$1; shift; fi
 [ "${1:-}" = "--" ] && shift
-ARGS="debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress wdt=-1 $*"
+ARGS="debug=0xc serial=3 keepsyms=1 -enable_kprintf_spam -noprogress wdt=-1 $*"
+# One cpus= only (default 1): xnu takes the first match.
+case " $* " in *" cpus="*) ;; *) ARGS="$ARGS cpus=1" ;; esac
 [ -n "$RD" ] && ARGS="$ARGS rd=md0"
 O=onclite/out
 python3 -I tools/mkadt.py $O/onclite.adt --onclite
