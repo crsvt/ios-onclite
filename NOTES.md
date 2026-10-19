@@ -184,6 +184,15 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   <= 64 MiB, zero blocks as FILL 0, never DONT_CARE) -> `research/ios-root/ios16-root.simg` 12,149,343,860 bytes,
   27333 chunks; decoded SHA-256 == raw 6995911b...c073d. Flashed with `fastboot flash userdata ios16-root.simg`
   (log `logs/flash-userdata.txt`). From here userdata is the iOS root: NEVER boot Lineage (hold Volume up/down).
+- **D1 (2026-10-20 01:50 IST = 19-10 20:20 UTC), root read-only:** emmcroot0 found (`userdata` 23099 MiB) but HFS
+  mount loops on `late jnl init: failed to open/create the journal` (mkfs -J journal is need-init: first mount writes).
+- **D2 (01:55 IST), `onclite/out/boot-d2-root-rw.img` = kernel out-onclite-12 + cpus=4 rd=emmcroot0 emmcrw=1 rootrw=1
+  ignition_level=1 launchd_unsecure_cache=1 wdt_test=no_user_checkin unentitled_ios_sim_launch=1
+  onclite_reboot_after=300; log `logs/xnu-d2-root-rw.txt`:** `hfs: Initializing the journal`, `creating the hotfile
+  btree`, `mounted iOSRoot on device b(1, 0)` (eMMC WRITES WORK) -> launchd PID 1 (libignition hello) -> shared cache
+  mapped (`not in trust cache` lines are informational, as on sweet) -> 157 execs in 5 min incl. logd, configd,
+  keybagd, lockdownd, watchdogd, backboardd, SpringBoard; no CRASH lines, no panic; no ONCLITE LSE emulation logged.
+  Ended by the reboot timer -> TWRP. Screen black (no display path yet).
 - Root image on the Mac: `research/ios-root/ios16-root.img` (SHA256 6995911b...c073d verified after rsync);
   deleted on the server (its ~/ios-onclite-root keeps tools/src/log only).
 - **iOS ROOT IMAGE BUILT on the server (2026-10-19 18:44-18:50 UTC):** `~/ios-onclite-root/build-root.sh` (copy in the
