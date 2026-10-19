@@ -12,10 +12,10 @@ index 6630131..c06142b 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/onclite_emmc.c b/bsd/dev/onclite_emmc.c
 new file mode 100644
-index 0000000..7c1798c
+index 0000000..3c8e872
 --- /dev/null
 +++ b/bsd/dev/onclite_emmc.c
-@@ -0,0 +1,1141 @@
+@@ -0,0 +1,1145 @@
 +/*
 + * onclite internal eMMC root device.
 + *
@@ -75,6 +75,8 @@ index 0000000..7c1798c
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 +/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++/* bsd/dev/sweet_sample.c: SpringBoard/backboardd stack sampler (boot-arg sweetsample) */
++extern void sweet_sample_start(void);
 +
 +/* SD Host Controller Simplified Specification 3.00 */
 +#define SDHCI_ADMA_SYS_ADDR     0x00
@@ -1139,6 +1141,8 @@ index 0000000..7c1798c
 +	printf("ONCLITE EMMC: \"%s\": first sector 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
 +	    want, se.first_block, se.nblocks * EMMC_BLOCK >> 20,
 +	    se.writable ? "read-write" : "read-only", se.dma_pa);
++	/* sweet_ufs.c starts its sampler with the root too. */
++	sweet_sample_start();
 +	return 0;
 +}
 +
