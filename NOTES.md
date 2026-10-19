@@ -199,6 +199,16 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   as its panel + default surface, and after each present scales it (nearest neighbour, uniform 1520/2436 -> 702x1520
   centered at x=9) into LK's splash, whose address/size/stride/byte order come from the MDP5 pipe LK left running
   (SRC0_ADDR in 0x90000000-0x91400000, RGB888, SRC_UNPACK_PATTERN: 0 G, 1 B, 2 R per byte).
+- **E1 (2026-10-20, 0107 kernel flashed to `boot`, normal LK boot, log `logs/xnu-e1-display.txt`):** splash pipe found
+  (`0x90001000 720x1520 stride 2160 format 0x2243f unpack 0x20001`), canvas set up, SpringBoard + backboardd exec,
+  `open AppleCLCD`, backboardd loops on `IOAcceleratorES -> 0 found`; no `SWEET FB: swap` before the user's
+  manual reset. Screen black.
+- **E2 (2026-10-20 02:40 IST, commit 916b078 = kernel with sweet_sample_start, onclite_reboot_after=480, log
+  `logs/xnu-e2-display.txt`): FIRST PIXELS ON THE REDMI 7.** backboardd creates IOSurfaces 2/3 (1125x2436 BGRA,
+  bpr 4608) and swaps 4 frames (`SWEET FB: swap 1..4`); the user saw the Apple logo on the panel, then the
+  480 s timer restarted to TWRP (warm PS_HOLD path works). CPU rendering works without IOAcceleratorES, as on
+  sweet. No sampler output lines were seen in the log. Lesson: Power + Volume up is a cold reset and loses the
+  ramoops log (a first E2 30-min run was lost that way); only Power + Volume down ~15 s keeps RAM.
 - Root image on the Mac: `research/ios-root/ios16-root.img` (SHA256 6995911b...c073d verified after rsync);
   deleted on the server (its ~/ios-onclite-root keeps tools/src/log only).
 - **iOS ROOT IMAGE BUILT on the server (2026-10-19 18:44-18:50 UTC):** `~/ios-onclite-root/build-root.sh` (copy in the
