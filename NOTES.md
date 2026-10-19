@@ -113,6 +113,15 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   libfirehose_kernel.a (libdispatch, built by xcodebuild without MACHINE_FLAGS) has LSE in 10 firehose functions
   (kernel os_log) -> would fault in kernel mode. Workflow now appends OTHER_CFLAGS[arch=arm64] ... -mcpu=cortex-a73
   to its xcconfig for ONCLITE, and an "ISA check" step lists any ARMv8.1+ instruction (K256 = data, expected).
+- **FIRST XNU BOOT ON THE REDMI 7 (2026-10-19 17:25 UTC):** CI run 39290336687 (f50c5f9, ISA check clean: only
+  K256 data) -> `xnu/out-onclite-4/kernel.development.onclite`, image `onclite/out/boot-a-noroot.img`
+  (`onclite/mkboot.sh K a-noroot`: cpus=1, no root). Log `logs/xnu-a-1.txt` (pstore, read from Lineage after the user's
+  Power + Volume down): shim -> CPU_ON 0x100 -> ONCLITE EARLY 1-20 -> `ONCLITE GIC: GICv2 typer=0x4ea virtual timer
+  INTID 20` -> Darwin 22.6.0 xnu-8796.141.3 -> VM (109809 free 16K pages) -> SWEET PRNG/pthread/AMFI/HFS -> SweetCPU
+  `cpu=0 mpidr=0x100 EL1 ... came alive; SGI1 OK` -> platform expert, AKS, WDT, IOSurface, HID, battery (static),
+  `SWEET FB: no boot framebuffer` (expected) -> Skywalk self-tests PASSED -> `Waiting on IOMedia Apple_HFS` = the
+  expected end without a root device. Timer IRQs, scheduler, SGI through GICv2, 16K pmap all work on hardware.
+- TWO PHONES may be on USB (a Mi A2 `jasmine_sprout` too): always `export ANDROID_SERIAL=$(cat .claude/device/adb-serial)` for adb/fastboot.
 - Not done yet: xnu reboot via PS_HOLD (panic just stops; warm-reset by hand), display (Phase 3), eMMC root.
 - CI: `.github/workflows/xnu.yml` also triggers on branch `onclite-ci` with MACHINE_CONFIG=ONCLITE
   (-> kernel.development.onclite). crsvt/ios-onclite is PUBLIC: check pushes for serials/IMEI/calibration first.
