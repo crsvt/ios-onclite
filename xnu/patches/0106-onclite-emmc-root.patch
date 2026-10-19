@@ -12,10 +12,10 @@ index 6630131..c06142b 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/onclite_emmc.c b/bsd/dev/onclite_emmc.c
 new file mode 100644
-index 0000000..b0c9db6
+index 0000000..f0c3571
 --- /dev/null
 +++ b/bsd/dev/onclite_emmc.c
-@@ -0,0 +1,952 @@
+@@ -0,0 +1,1015 @@
 +/*
 + * onclite internal eMMC root device.
 + *
@@ -99,6 +99,21 @@ index 0000000..b0c9db6
 +#define SDCC_HC_MODE            0x78
 +#define HC_MODE_EN              (1u << 0)
 +#define FF_CLK_SW_RST_DIS       (1u << 13)
++/*
++ * A write to SDHCI_POWER_CONTROL raises a PWRCTL request that software has
++ * to acknowledge once the supplies are set (Linux sdhci-msm, LK
++ * sdhci_int_handler). LK keeps the eMMC regulators on, so it is acked here.
++ */
++#define SDCC_PWRCTL_STATUS      0xdc
++#define SDCC_PWRCTL_MASK        0xe0
++#define SDCC_PWRCTL_CLEAR       0xe4
++#define SDCC_PWRCTL_CTL         0xe8
++#define PWRCTL_BUS_OFF          (1u << 0)
++#define PWRCTL_BUS_ON           (1u << 1)
++#define PWRCTL_IO_LOW           (1u << 2)
++#define PWRCTL_IO_HIGH          (1u << 3)
++#define PWRCTL_BUS_SUCCESS      (1u << 0)
++#define PWRCTL_IO_SUCCESS       (1u << 2)
 +
 +#define PRES_CMD_INHIBIT        (1u << 0)
 +#define PRES_DATA_INHIBIT       (1u << 1)
@@ -112,6 +127,7 @@ index 0000000..b0c9db6
 +#define CLK_SD_EN               (1u << 2)
 +
 +#define PWR_BUS_ON              (1u << 0)
++#define PWR_180                 (5u << 1)       /* caps: 1.8 V only (bit 26) */
 +
 +#define RESET_CMD               (1u << 1)
 +#define RESET_DATA              (1u << 2)
@@ -436,6 +452,51 @@ index 0000000..b0c9db6
 +	return se.cache_on ? emmc_switch(EXT_CSD_FLUSH_CACHE, 1) : 0;
 +}
 +
++static inline uint32_t
++core_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(se.core + off);
++}
++
++static inline void
++core_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(se.core + off) = v;
++}
++
++/* SDHCI bus power on at 1.8 V with sdhci-msm's PWRCTL acknowledge, polled. */
++static int
++emmc_bus_power_on(void)
++{
++	printf("ONCLITE EMMC: PWRCTL status 0x%x mask 0x%x ctl 0x%x before bus power\n",
++	    core_rd(SDCC_PWRCTL_STATUS), core_rd(SDCC_PWRCTL_MASK), core_rd(SDCC_PWRCTL_CTL));
++	for (int step = 0; step < 2; step++) {
++		wr8(SDHCI_POWER_CONTROL, (uint8_t)(PWR_180 | (step ? PWR_BUS_ON : 0)));
++		uint32_t st = 0;
++		uint64_t deadline = deadline_after(20 * NSEC_PER_MSEC);
++		while (!(st = core_rd(SDCC_PWRCTL_STATUS) & 0xf) && mach_absolute_time() < deadline) {
++			delay(10);
++		}
++		uint32_t ack = 0;
++		if (st & (PWRCTL_BUS_ON | PWRCTL_BUS_OFF)) {
++			ack |= PWRCTL_BUS_SUCCESS;
++		}
++		if (st & (PWRCTL_IO_LOW | PWRCTL_IO_HIGH)) {
++			ack |= PWRCTL_IO_SUCCESS;
++		}
++		if (st) {
++			core_wr(SDCC_PWRCTL_CLEAR, st);
++			core_wr(SDCC_PWRCTL_CTL, ack);
++		}
++		printf("ONCLITE EMMC: power write 0x%x: PWRCTL request 0x%x, acked 0x%x\n",
++		    PWR_180 | (step ? PWR_BUS_ON : 0), st, ack);
++	}
++	delay(1000);
++	uint8_t power = rd8(SDHCI_POWER_CONTROL);
++	printf("ONCLITE EMMC: bus power 0x%x, present 0x%x\n", power, rd32(SDHCI_PRESENT_STATE));
++	return (power & PWR_BUS_ON) ? 0 : EIO;
++}
++
 +/* Undo LK's target_uninit(): SDHCI mode back on, keeping its clock and bus setup. */
 +static int
 +emmc_enable_hc_mode(void)
@@ -505,9 +566,11 @@ index 0000000..b0c9db6
 +	printf("ONCLITE EMMC: SDHCI version 0x%x caps 0x%x present 0x%x host 0x%x power 0x%x "
 +	    "host2 0x%x clock 0x%x\n", version, caps, present, hctl, power, hctl2, clk);
 +	if (!(power & PWR_BUS_ON)) {
-+		/* Powering the bus needs sdhci-msm's PWRCTL handshake: not done here. */
-+		printf("ONCLITE EMMC: bus power is off\n");
-+		return ENXIO;
++		error = emmc_bus_power_on();
++		if (error) {
++			printf("ONCLITE EMMC: bus power did not come on\n");
++			return error;
++		}
 +	}
 +	if (!(clk & CLK_INT_EN) || !(clk & CLK_INT_STABLE)) {
 +		printf("ONCLITE EMMC: internal clock not running\n");

@@ -142,6 +142,14 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
 - **eMMC test C2 (18:17 UTC, CI 39299535216):** `HC_MODE 0x0` confirmed; with SDHCI mode back on the clock reads
   0x3 (internal clock on, card clock gate off; C1's 0x7 was the stale MCI-mode view). Driver now logs power/host2 and
   sets SD_CLK_EN (divider stays 0 = GCC rate from LK) when bus power is on. Auto-reset returned in 61 s.
+- **eMMC test C3 (2026-10-19 18:33 UTC, CI 39301560321):** after HC_MODE_EN: `power 0x0 host2 0x3 clock 0x3` =
+  SDHCI bus power off, HS200 (UHS mode 3), card clock off. Caps 0x342dc8b2 = 1.8 V only. Driver now writes POWER 0x0A
+  then 0x0B and acks each sdhci-msm PWRCTL request (core_mem +0xdc status, +0xe4 clear, +0xe8 ctl: bus success bit 0,
+  io success bit 2), then enables the card clock.
+- Server (2026-10-19 18:25): 34.100.214.145, 22 GB free. Installed hfsprogs, android-sdk-libsparse-utils,
+  linux-modules-extra-6.8.0-1070-gcp (hfsplus), cmake/fuse3 dev; apfs-fuse built (sgan81 66b86bd) ->
+  /usr/local/bin. Work dir ~/ios-onclite-root/{tools,src,ipsw}. It stopped answering (no ssh, no ping) ~5 min after
+  boot, as on 10-19 earlier: likely spot/preemptible VM or GCP firewall.
 - Reference (user, 2026-10-19): https://github.com/dipa-studio/ios-extra = sweet's driver playground (Adreno 618
   GPU bring-up: GMU, power, SMMU; docs/GPU_API_RE.md on how this iOS image loads Metal device plugins). onclite has
   an Adreno 506 (different generation); only the iOS-side GPU/Metal research carries over, later.
