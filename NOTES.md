@@ -164,6 +164,13 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   RCA 2, 8-bit High Speed ~50 MHz, state tran; EXT_CSD rev 8, 61071360 sectors (29820 MiB), partition config 0x38,
   cache off; all 59 GPT entries (userdata first 0xd20000, 0x2d1dfdf sectors = 23.65 GB); self-test SHA-256 of fsc,
   vbmeta, dtbo == backup/SHA256SUMS (byte-exact reads). Writes still untested (emmcrw=1 gates them).
+- **After flashing iOS to userdata, never boot Lineage:** its fstab has `userdata f2fs ... formattable,
+  fileencryption=...`; a failed /data mount makes init reboot to recovery with --prompt_and_wipe_data. So 0105 now
+  writes LK's boot mode into PM8953 PON SOFT_RB_SPARE (0x88f bits 7:2, LK USE_PON_REBOOT_REG: 1 recovery,
+  2 fastboot; the IMEM reason is not used by this LK, which is why the probes' IMEM writes were ignored) via SPMI
+  arbiter v2 (core 0x200f000 map 0x800+4n ppid 0x008, cnfg 0x200a000+0x700+4n owner, chnls 0x2400000/obsrvr
+  0x2c00000 + 0x8000*apid, ee 0) before PS_HOLD. Default: recovery (TWRP from the recovery partition; read pstore
+  there). Boot-arg onclite_reset_to=normal|recovery|fastboot. backup/recovery.img (TWRP) added, sha ok.
 - Root image on the Mac: `research/ios-root/ios16-root.img` (SHA256 6995911b...c073d verified after rsync);
   deleted on the server (its ~/ios-onclite-root keeps tools/src/log only).
 - **iOS ROOT IMAGE BUILT on the server (2026-10-19 18:44-18:50 UTC):** `~/ios-onclite-root/build-root.sh` (copy in the

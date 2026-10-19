@@ -1,8 +1,8 @@
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..391a5a8 100644
+index 0631685..0349d5d 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -10,6 +10,53 @@
+@@ -10,6 +10,149 @@
  #include <IOKit/IODeviceTreeSupport.h>
  #include <IOKit/IOLib.h>
  
@@ -19,13 +19,103 @@ index 0631685..391a5a8 100644
 + * Panics reach this with a debug= value without DB_NMI (0x4), e.g. 0x8.
 + * Boot-arg onclite_reboot_after=N restarts N seconds after the platform
 + * expert starts, for unattended tests.
++ *
++ * Before dropping PS_HOLD the boot mode for LK goes into the PM8953 PON
++ * register SOFT_RB_SPARE (0x88f, bits 7:2; LK USE_PON_REBOOT_REG: 1 recovery,
++ * 2 fastboot). Default recovery: once userdata holds the iOS root, a normal
++ * Android boot must never run (its fstab marks /data formattable). Boot-arg
++ * onclite_reset_to=normal|recovery|fastboot. The write is a polled SPMI
++ * command through the PMIC arbiter v2 (Linux spmi-pmic-arb.c), EE 0.
 + */
 +#define ONCLITE_PSHOLD_PA       0x004ab000UL
++#define SPMI_CORE_PA            0x0200f000UL    /* reg-names core, chnls, obsrvr, cnfg */
++#define SPMI_CHNLS_PA           0x02400000UL
++#define SPMI_OBSRVR_PA          0x02c00000UL
++#define SPMI_CNFG_PA            0x0200a000UL
++#define SPMI_APID_MAP(n)        (0x800 + 4 * (n))
++#define SPMI_OWNER(n)           (0x700 + 4 * (n))
++#define SPMI_CMD                0x00
++#define SPMI_STATUS             0x08
++#define SPMI_WDATA0             0x10
++#define SPMI_RDATA0             0x18
++#define SPMI_OP_WRITEL          0u
++#define SPMI_OP_READL           1u
++#define PON_PPID                0x008           /* SID 0, peripheral 0x08 (PON) */
++#define PON_SOFT_RB_SPARE       0x8f
++#define LK_MODE_NORMAL          0
++#define LK_MODE_RECOVERY        1
++#define LK_MODE_FASTBOOT        2
 +
 +extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern "C" kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 +
 +static volatile uint32_t *onclite_pshold;
++static vm_offset_t onclite_spmi_chnl, onclite_spmi_obsrvr;     /* the PON channel's windows */
++static uint32_t onclite_reset_mode = LK_MODE_RECOVERY;
++
++static int
++onclite_spmi_wait(vm_offset_t window)
++{
++	for (int i = 0; i < 10000; i++) {
++		uint32_t st = *(volatile uint32_t *)(window + SPMI_STATUS);
++		if (st & 1) {
++			return (st & 0xe) ? (int)st : 0;   /* failure, denied, dropped */
++		}
++		IODelay(1);
++	}
++	return -1;
++}
++
++static int
++onclite_pon_read(uint8_t *value)
++{
++	if (!onclite_spmi_obsrvr) {
++		return -1;
++	}
++	*(volatile uint32_t *)(onclite_spmi_obsrvr + SPMI_CMD) = (SPMI_OP_READL << 27) | (PON_SOFT_RB_SPARE << 4);
++	int rc = onclite_spmi_wait(onclite_spmi_obsrvr);
++	if (!rc) {
++		*value = (uint8_t)*(volatile uint32_t *)(onclite_spmi_obsrvr + SPMI_RDATA0);
++	}
++	return rc;
++}
++
++static int
++onclite_pon_write(uint8_t value)
++{
++	if (!onclite_spmi_chnl) {
++		return -1;
++	}
++	*(volatile uint32_t *)(onclite_spmi_chnl + SPMI_WDATA0) = value;
++	*(volatile uint32_t *)(onclite_spmi_chnl + SPMI_CMD) = (SPMI_OP_WRITEL << 27) | (PON_SOFT_RB_SPARE << 4);
++	return onclite_spmi_wait(onclite_spmi_chnl);
++}
++
++/* Find the PON channel (apid) and map its write/read windows. */
++static void
++onclite_spmi_init(void)
++{
++	vm_offset_t core = ml_io_map(SPMI_CORE_PA, 0x1000);
++	vm_offset_t cnfg = ml_io_map(SPMI_CNFG_PA, 0x1000);
++	if (!core || !cnfg) {
++		return;
++	}
++	for (uint32_t apid = 0; SPMI_APID_MAP(apid) < 0x1000; apid++) {
++		uint32_t map = *(volatile uint32_t *)(core + SPMI_APID_MAP(apid));
++		if (map == 0 || ((map >> 8) & 0xfff) != PON_PPID) {
++			continue;
++		}
++		uint32_t owner = *(volatile uint32_t *)(cnfg + SPMI_OWNER(apid)) & 7;
++		IOLog("ONCLITE: SPMI PON is channel %u (owner EE %u)\n", apid, owner);
++		if (owner != 0) {
++			return;
++		}
++		onclite_spmi_chnl = ml_io_map(SPMI_CHNLS_PA + 0x8000 * apid, 0x1000);
++		onclite_spmi_obsrvr = ml_io_map(SPMI_OBSRVR_PA + 0x8000 * apid, 0x1000);
++		return;
++	}
++	IOLog("ONCLITE: SPMI PON channel not found\n");
++}
 +
 +static int
 +onclite_halt_restart(unsigned int type)
@@ -34,7 +124,13 @@ index 0631685..391a5a8 100644
 +	    type == kPEPanicEnd || onclite_pshold == NULL) {
 +		return 0;
 +	}
-+	kprintf("ONCLITE: restart (type %u) via PS_HOLD\n", type);
++	uint8_t spare = 0;
++	int rc = onclite_pon_read(&spare);
++	if (!rc && onclite_reset_mode != LK_MODE_NORMAL) {
++		rc = onclite_pon_write((uint8_t)((spare & 3) | (onclite_reset_mode << 2)));
++	}
++	kprintf("ONCLITE: restart (type %u) via PS_HOLD, LK mode %u (SOFT_RB_SPARE 0x%x, spmi %d)\n",
++	    type, onclite_reset_mode, spare, rc);
 +	__builtin_arm_dsb(DSB_SY);
 +	*onclite_pshold = 0;
 +	__builtin_arm_dsb(DSB_SY);
@@ -56,11 +152,20 @@ index 0631685..391a5a8 100644
  class SweetPlatformExpert : public IODTPlatformExpert {
  	OSDeclareDefaultStructors(SweetPlatformExpert);
  
-@@ -31,6 +78,21 @@ SweetPlatformExpert::start(IOService *provider)
+@@ -31,6 +174,30 @@ SweetPlatformExpert::start(IOService *provider)
  	}
  	registerService();
  	IOLog("SWEET: platform expert registered\n");
 +#if defined(ONCLITE)
++	char mode[16] = "recovery";
++	PE_parse_boot_argn("onclite_reset_to", mode, sizeof(mode));
++	onclite_reset_mode = !strcmp(mode, "normal") ? LK_MODE_NORMAL :
++	    !strcmp(mode, "fastboot") ? LK_MODE_FASTBOOT : LK_MODE_RECOVERY;
++	onclite_spmi_init();
++	uint8_t spare = 0;
++	int spmi_rc = onclite_pon_read(&spare);
++	IOLog("ONCLITE: PON SOFT_RB_SPARE 0x%x (spmi %d), restarts go to LK mode %u\n",
++	    spare, spmi_rc, onclite_reset_mode);
 +	onclite_pshold = (volatile uint32_t *)ml_io_map(ONCLITE_PSHOLD_PA, PAGE_SIZE);
 +	if (onclite_pshold != NULL) {
 +		PE_halt_restart = onclite_halt_restart;
