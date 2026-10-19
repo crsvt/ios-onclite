@@ -25,8 +25,27 @@ Observed on the device (TWRP, 4.19.325-perf, 3 GB unit, hwversion 2.19.0):
 - Keys: vol-up TLMM GPIO 85 (gpio-keys); power/vol-down on PM8953 PON (SPMI arb 0x200f000, pm8953 SID 0/1, pmi632 SID 2/3).
 - Regulators via RPM-SMD (not RPMh). USB: dwc3 0x7000000 + QUSB2 PHY 0x79000. Debug UART: uartdm 0x78af000
   (`console=ttyMSM0,115200`) - a possible serial console if test pads exist.
-Next: (1) scan the iPhone X 20H392 dyld shared cache for LSE/FP16 instructions; (2) LK-packaged shim probe (MMFR0, CNTFRQ,
-GICv2, PSCI CPU_ON per MPIDR, fb at 0x90001000) via `fastboot boot` only.
+
+Phase 0 results (2026-10-19). User: keep everything in this folder, do not push to git (commits stay local).
+- Backups (read-only dd, sha256 == on-device): `backup/{boot,dtbo,vbmeta,persist,modemst1,modemst2,fsg,fsc}.img` + SHA256SUMS.
+  `dtb/boot_unpacked/` = stock boot.img v1 unpacked; `dtb` = the one DTB appended to the stock Image.gz.
+- **ISA scan of the iPhone X 20H392 arm64 dyld cache** (`research/ipsw-x/dyld/`, fetched with `.claude/tools/ipsw/ipsw extract
+  --dyld --remote`; scanner `.claude/scripts/dsc_isa_scan.py`, venv `.claude/venv`; outputs `research/ipsw-x/isa-*.txt`):
+  2710 images, 387M instructions in instruction sections, 2394 above ARMv8.0 in 40 images. 510 sit in `$VARIANT$armv81`
+  functions (dyld picks those only if the commpage reports LSE -> never on Kryo 250). 1884 are unconditional:
+  libdispatch 338 LSE in 138 functions (queue drain/worker/mach paths, hot), pthread 18, platform 12
+  (`__os_unfair_lock_lock_slow` does CASA with no fallback), malloc 6, libm/corecrypto/a few frameworks ~40;
+  libBNNS 1297 FP16 (ML kernels, expected capability-gated); ActionKit mixed. dyld `K256` hit = SHA-256 table (false positive).
+  Verdict: not a blocker. Plan = XNU EL0 undefined-instruction emulation of CAS/CASP/LD<op>/SWP/LDAPR (LDXR/STXR loop),
+  count traps; if libdispatch trap rate hurts, binary-patch hot sites in our root image's cache.
+- **Probe** `onclite/probe/` (start.S, probe.c, probe.ld, build.sh; packer `tools/mkbootimg-v1.py` copies the stock header).
+  Toolchain: Arm GNU 14.2.rel1 aarch64-none-elf in `.claude/tools/` (sha256 verified). Output `onclite/probe/out/probe-boot.img`;
+  header identical to stock except sizes, appended DTB byte-identical. Reads MDP5 SSPP SRC0_ADDR/YSTRIDE/FORMAT of
+  VIG0/RGB0/RGB1/DMA0 to find LK's splash (fallback 0x90001000 720x1520 RGB888), prints MIDR/MPIDR/MMFR0-2/ISAR0-1/PFR0/
+  CNTFRQ with a 16K-granule verdict, PSCI version/features, CPU_ON for MPIDR 1-3,0x100-0x103 (each reports its MMFR0),
+  GICv2 regs and vtimer (INTID 20) / ptimer (19) IRQ counts over 300 ms (30 = ok); then reboots to fastboot after 120 s
+  (IMEM 0x0860065c = 0x77665500, PSCI SYSTEM_RESET). NOT YET RUN on the device.
+Next: user runs `fastboot boot onclite/probe/out/probe-boot.img` and photographs the screen; decide 16K vs 4K-page XNU.
 
 ## Agent handoff / active work (2026-10-15, latest)
 
