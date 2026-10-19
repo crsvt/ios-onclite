@@ -126,6 +126,9 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   `4/4 CPUs initialized` -> `BSD root: md0` -> `*** SWEET userspace: init running as PID 1 ***` -> 79 heartbeats
   (every 5 s) until the manual reset, no panic. SMP on the whole Gold cluster, exec, code signature, syscalls, devfs
   console all work on hardware. Next: eMMC (SDHCI) driver for the userdata root; reset via PS_HOLD.
+- PUSH ONLY with `.claude/scripts/safe-push.sh` (refuses added lines containing identifiers from
+  `.claude/device/identifiers.txt`). An earlier push leaked the Redmi 7 adb serial in NOTES.md history (commit
+  ae7de0f..); removed from the file since d2b3c2a; history rewrite of onclite-ci awaits the user's decision.
 - TWO PHONES may be on USB (a Mi A2 `jasmine_sprout` too): always `export ANDROID_SERIAL=$(cat .claude/device/adb-serial)` (Redmi 7 serial, kept out of git) for adb/fastboot.
 - **eMMC test C1 (17:58 UTC, CI 39297041914):** auto-reboot via PS_HOLD works (panic -> back in Lineage after 65 s,
   `logs/xnu-c-emmctest-1.txt`). eMMC: `SDHCI version 0x4d02 caps 0x342dc8b2 present 0x1f80000 host 0x30 clock 0x7`,
