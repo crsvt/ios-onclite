@@ -8,3 +8,5 @@ shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
+# agent-local data: device dumps, fresh kernel clones, tools
+.claude/

@@ -1,5 +1,33 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> ONCLITE PORT (Redmi 7, SDM632) - started 2026-10-19, read first <<<
+Goal: adapt this sweet port to Redmi 7 `onclite` (Redmi Y3 `onc` is the same SoC). Nothing ported yet;
+all code below is still sweet's. Local, untracked data in `.claude/` (gitignored):
+`.claude/device/` live.dtb + live.txt (decoded), iomem.txt, dmesg-key.txt, boot-hdr.bin;
+`.claude/src/kernel-4.19/` fresh shallow clone of crsvt/kernel_public `public-rebase` (2b8d5d7ad, 4.19.325).
+adb/fastboot: `~/.claude/tools/platform-tools/`. Build server `crsvt` (GCP asia-south1-b): IP changes on restart
+(34.100.214.145 on 10-19, same ED25519 host key as the old 34.93.131.30), disk 96% full (23G free), no clang/gcc-aarch64 yet;
+dropped off after one login on 10-19. Its existing `~/android_kernel_xiaomi_onclite` was left untouched.
+
+Observed on the device (TWRP, 4.19.325-perf, 3 GB unit, hwversion 2.19.0):
+- CPU: Kryo 250, MIDR part 0x801 x4 (cpu0-3, MPIDR 0x0-0x3) + 0x800 x4 (cpu4-7, MPIDR 0x100-0x103). ARMv8.0:
+  Features `fp asimd evtstrm aes pmull sha1 sha2 crc32 cpuid` - NO atomics (LSE), no fphp/asimdhp/asimddp; PAN emulated.
+- 16K granule: not measured yet. Expectation (A53/A73 class): unsupported -> needs a 4K-page XNU. Measure MMFR0 with the shim.
+- Boot: LK aboot, boot.img header v1, page 2048, kernel 0x80008000, ramdisk 0x81000000, tags 0x80000100, DTB appended
+  to the kernel (no v2 dtb section), separate dtbo (dtbo_idx=2, dtb_idx=0). PSCI 1.0 via SMC, enable-method psci.
+- GIC: **GICv2** `qcom,msm-qgic2`, GICD 0x0b000000, GICC 0x0b002000 (not GICv3 like sweet). Timer PPIs: sec-phys 2,
+  ns-phys 3 (INTID 19), virt 4 (INTID 20), hyp 1. 19.2 MHz assumed (check CNTFRQ).
+- RAM: 0x40000000+1G, 0x80000000+2G. Linux System RAM 0x40000000-0x849fffff, 0x86800000-0x86bfffff, 0x8f100000-0xffffffff.
+  Splash/fb reserved 0x90001000 size 0x13ff000; ramoops 0x91400000+4M. fb0 720x1520 (virtual 3040), 32 bpp.
+- Panel: BOE HX8394F 720p **video** mode (cmdline mdss_dsi_boe_hx8394f_720p_video), MDP5 at 0x1a00000.
+- Storage: eMMC, sdhci-msm 0x7824900 (sdcc1). No UFS.
+- Touch: FocalTech `fts_ts` bound at I2C 0x38 on QUP 0x78b7000 (i2c-msm-v2), irq TLMM GPIO 65. goodix@14 node present, unbound.
+- Keys: vol-up TLMM GPIO 85 (gpio-keys); power/vol-down on PM8953 PON (SPMI arb 0x200f000, pm8953 SID 0/1, pmi632 SID 2/3).
+- Regulators via RPM-SMD (not RPMh). USB: dwc3 0x7000000 + QUSB2 PHY 0x79000. Debug UART: uartdm 0x78af000
+  (`console=ttyMSM0,115200`) - a possible serial console if test pads exist.
+Next: (1) scan the iPhone X 20H392 dyld shared cache for LSE/FP16 instructions; (2) LK-packaged shim probe (MMFR0, CNTFRQ,
+GICv2, PSCI CPU_ON per MPIDR, fb at 0x90001000) via `fastboot boot` only.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
