@@ -1,8 +1,8 @@
 diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
-index b40eccd..977b457 100644
+index b40eccd..27a14ee 100644
 --- a/bsd/dev/sweet_sample.c
 +++ b/bsd/dev/sweet_sample.c
-@@ -18,10 +18,11 @@
+@@ -18,11 +18,16 @@
  #include <sys/proc_internal.h>
  #include <kern/task.h>
  #include <kern/thread.h>
@@ -13,9 +13,14 @@ index b40eccd..977b457 100644
  extern task_t proc_task(proc_t);
 -extern int hz;
  extern void sweet_sample_start(void);
++#include <pexpert/arm64/board_config.h>
++#if defined(ONCLITE)
++extern uint64_t onclite_lse_emulated(void);    /* osfmk/arm64/onclite_lse.c */
++#endif
  
  static char sweet_sample_names[128];
-@@ -60,21 +61,36 @@ sweet_sample_proc(proc_t p, __unused void *arg)
+ 
+@@ -60,21 +65,40 @@ sweet_sample_proc(proc_t p, __unused void *arg)
  	return PROC_RETURNED;
  }
  
@@ -48,7 +53,11 @@ index b40eccd..977b457 100644
 +	printf("SMP sampler for %s: first sample in 90 s\n", sweet_sample_names);
 +	sweet_sample_sleep(90);
  	for (int i = 0; i < 40; i++) {
++#if defined(ONCLITE)
++		printf("SMP --- sample %d (LSE emulated so far: %llu)\n", i, onclite_lse_emulated());
++#else
  		printf("SMP --- sample %d\n", i);
++#endif
  		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
 -		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
 +		sweet_sample_sleep(120);

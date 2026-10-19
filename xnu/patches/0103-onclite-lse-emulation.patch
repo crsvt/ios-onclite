@@ -168,10 +168,10 @@ index 2449334..00118b4 100644
   * int _bcopyout(const char *src, char *dst, vm_size_t len)
 diff --git a/osfmk/arm64/onclite_lse.c b/osfmk/arm64/onclite_lse.c
 new file mode 100644
-index 0000000..733fb46
+index 0000000..e39cae0
 --- /dev/null
 +++ b/osfmk/arm64/onclite_lse.c
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,187 @@
 +/*
 + * onclite: EL0 emulation of the ARMv8.1 LSE atomics (and ARMv8.3 LDAPR).
 + *
@@ -206,6 +206,14 @@ index 0000000..733fb46
 +boolean_t onclite_emulate_lse(arm_saved_state_t *state, uint32_t instr);
 +
 +static uint64_t _Atomic onclite_lse_count;
++
++/* Emulated instructions so far (printed by bsd/dev/sweet_sample.c). */
++uint64_t onclite_lse_emulated(void);
++uint64_t
++onclite_lse_emulated(void)
++{
++	return os_atomic_load(&onclite_lse_count, relaxed);
++}
 +
 +/* Rs/Rt/Rs+1 as data: register 31 is XZR. */
 +static uint64_t
