@@ -159,6 +159,13 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   the card answers nothing. Likely LK's HS200 sampling path is still selected. Now, as sdhci-msm does below 100 MHz:
   hc_mem+0x10c VENDOR_SPEC clear HC_SELECT_IN_EN/HC_SELECT_IN, MCLK_SEL=2; hc_mem+0x100 DLL_CONFIG |= DLL_RST|DLL_PDN.
   (Vendor DLL/VENDOR_SPEC are hc_mem-relative on "MCI present"; HC_MODE/PWRCTL are core_mem-relative.)
+- **eMMC WORKS (test C6, 2026-10-19 19:16 UTC, CI 39308079366, `logs/xnu-c6-emmctest.txt`):** after the DLL/
+  feedback-clock setup (VENDOR_SPEC 0x358b1c -> 0x18a1c) the card answers: OCR 0xc0ff8080, CID manufacturer 0x15,
+  RCA 2, 8-bit High Speed ~50 MHz, state tran; EXT_CSD rev 8, 61071360 sectors (29820 MiB), partition config 0x38,
+  cache off; all 59 GPT entries (userdata first 0xd20000, 0x2d1dfdf sectors = 23.65 GB); self-test SHA-256 of fsc,
+  vbmeta, dtbo == backup/SHA256SUMS (byte-exact reads). Writes still untested (emmcrw=1 gates them).
+- Root image on the Mac: `research/ios-root/ios16-root.img` (SHA256 6995911b...c073d verified after rsync);
+  deleted on the server (its ~/ios-onclite-root keeps tools/src/log only).
 - **iOS ROOT IMAGE BUILT on the server (2026-10-19 18:44-18:50 UTC):** `~/ios-onclite-root/build-root.sh` (copy in the
   session scratchpad; remotezip of OS 087-86698-044, SystemOS 087-86593-047, AppOS 087-86715-047 from the 20H392 IPSW,
   names from BuildManifest D22AP erase identity) -> tools/mkiosroot.sh 16G -> fsck OK -> sweet-root-tweaks.py ->
