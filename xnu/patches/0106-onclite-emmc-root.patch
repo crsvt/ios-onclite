@@ -12,10 +12,10 @@ index 6630131..c06142b 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/onclite_emmc.c b/bsd/dev/onclite_emmc.c
 new file mode 100644
-index 0000000..f0c3571
+index 0000000..9af777c
 --- /dev/null
 +++ b/bsd/dev/onclite_emmc.c
-@@ -0,0 +1,1015 @@
+@@ -0,0 +1,1119 @@
 +/*
 + * onclite internal eMMC root device.
 + *
@@ -27,8 +27,12 @@ index 0000000..f0c3571
 + * vendor "core_mem" HC_MODE register, which hands the host back to the
 + * legacy MCI interface: SDHCI commands then never complete. So this driver
 + * first sets HC_MODE_EN again (no controller reset) and wakes and selects the
-+ * card (CMD5 awake, CMD7). Otherwise it reuses LK's state like sweet_ufs.c
-+ * does for UFS: it switches
++ * card. LK also leaves SDHCI bus power and the card clock off, and the card
++ * (left in HS200) does not answer CMD5 there, so unless CMD13 finds it in the
++ * transfer state the driver identifies it again from scratch: CMD0, CMD1,
++ * CMD2, CMD3, CMD7 at ~400 kHz, then an 8-bit bus and High Speed (CMD6) at
++ * ~48 MHz, which needs no tuning (HS200 would). Otherwise it reuses LK's state
++ * like sweet_ufs.c does for UFS: it switches
 + * the host to ADMA2 (32-bit; all kernel RAM is below 4 GiB), keeps LK's bus
 + * width, timing and clock, and issues polled CMD17/18 and CMD24/25 (auto
 + * CMD12) to the user data area. It finds one GPT partition by name (boot-arg
@@ -119,8 +123,12 @@ index 0000000..f0c3571
 +#define PRES_DATA_INHIBIT       (1u << 1)
 +#define PRES_DAT0               (1u << 20)
 +
++#define HCTL_4BIT               (1u << 1)
++#define HCTL_HISPD              (1u << 2)
 +#define HCTL_DMA_MASK           (3u << 3)
 +#define HCTL_ADMA2_32           (2u << 3)
++#define HCTL_8BIT               (1u << 5)
++#define HCTL2_UHS_MASK          7u
 +
 +#define CLK_INT_EN              (1u << 0)
 +#define CLK_INT_STABLE          (1u << 1)
@@ -148,6 +156,7 @@ index 0000000..f0c3571
 +#define TM_MULTI                (1u << 5)
 +
 +#define CMD_RESP_NONE           0u
++#define CMD_RESP_136            1u
 +#define CMD_RESP_48             2u
 +#define CMD_RESP_48_BUSY        3u
 +#define CMD_CRC                 (1u << 3)
@@ -155,6 +164,17 @@ index 0000000..f0c3571
 +#define CMD_DATA                (1u << 5)
 +#define CMD_R1                  (CMD_RESP_48 | CMD_CRC | CMD_INDEX)
 +#define CMD_R1B                 (CMD_RESP_48_BUSY | CMD_CRC | CMD_INDEX)
++#define CMD_R2                  (CMD_RESP_136 | CMD_CRC)
++#define CMD_R3                  CMD_RESP_48
++
++#define MMC_GO_IDLE             0
++#define MMC_SEND_OP_COND        1
++#define MMC_ALL_SEND_CID        2
++#define MMC_SET_RELATIVE_ADDR   3
++#define OCR_BUSY                (1u << 31)
++#define OCR_ARG                 0x40ff8080u     /* sector mode, 2.7-3.6 V + 1.70-1.95 V */
++#define EXT_CSD_BUS_WIDTH_8     2
++#define EXT_CSD_TIMING_HS       1
 +
 +#define MMC_SLEEP_AWAKE         5
 +#define MMC_SELECT_CARD         7
@@ -387,7 +407,7 @@ index 0000000..f0c3571
 +		return error;
 +	}
 +	wr32(SDHCI_INT_STATUS, status);
-+	if (*r1 & R1_ERRORS) {
++	if ((resp_flags & CMD_INDEX) && (*r1 & R1_ERRORS)) {
 +		printf("ONCLITE EMMC: CMD%u card status 0x%x\n", index, *r1);
 +		return EIO;
 +	}
@@ -516,38 +536,122 @@ index 0000000..f0c3571
 +}
 +
 +/*
-+ * Bring the card from LK's sleep (or standby) to the transfer state. A
-+ * sleeping card answers only CMD0 and CMD5, so CMD13 times out there.
++ * Card clock from the SDHCI 10-bit divider (SDCLK = base / (2 N)), as LK's
++ * sdhci_clk_supply does: the GCC rate under it stays what LK chose (192 MHz
++ * for HS200; the caps base field says 200 MHz).
 + */
++static int
++emmc_set_clock(uint32_t khz)
++{
++	uint32_t base_khz = ((rd32(SDHCI_CAPABILITIES) >> 8) & 0xff) * 1000;
++	uint32_t n = 0;
++	if (base_khz == 0) {
++		return ENXIO;
++	}
++	if (khz < base_khz) {
++		n = (base_khz + 2 * khz - 1) / (2 * khz);
++		if (n > 0x3ff) {
++			n = 0x3ff;
++		}
++	}
++	wr16(SDHCI_CLOCK_CONTROL, rd16(SDHCI_CLOCK_CONTROL) & ~CLK_SD_EN);
++	uint16_t clk = (uint16_t)(((n & 0xff) << 8) | (((n >> 8) & 3) << 6) | CLK_INT_EN);
++	wr16(SDHCI_CLOCK_CONTROL, clk);
++	uint64_t deadline = deadline_after(20 * NSEC_PER_MSEC);
++	while (!(rd16(SDHCI_CLOCK_CONTROL) & CLK_INT_STABLE)) {
++		if (mach_absolute_time() > deadline) {
++			printf("ONCLITE EMMC: clock divider %u not stable\n", n);
++			return EIO;
++		}
++		delay(10);
++	}
++	wr16(SDHCI_CLOCK_CONTROL, (uint16_t)(clk | CLK_SD_EN));
++	delay(1000);
++	printf("ONCLITE EMMC: card clock ~%u kHz (divider %u, clock 0x%x)\n",
++	    n ? base_khz / (2 * n) : base_khz, n, rd16(SDHCI_CLOCK_CONTROL));
++	return 0;
++}
++
++/*
++ * Identify the card again from scratch (JESD84 card identification mode) and
++ * leave it selected in High Speed on an 8-bit bus.
++ */
++static int
++emmc_init_card(void)
++{
++	uint32_t r = 0, arg = se.rca << 16;
++	int error;
++
++	/* Legacy timing on the host: 1-bit bus, no high speed, no UHS mode. */
++	wr8(SDHCI_HOST_CONTROL, (uint8_t)(rd8(SDHCI_HOST_CONTROL) & ~(HCTL_4BIT | HCTL_8BIT | HCTL_HISPD)));
++	wr16(SDHCI_HOST_CONTROL2, (uint16_t)(rd16(SDHCI_HOST_CONTROL2) & ~HCTL2_UHS_MASK));
++	if ((error = emmc_set_clock(400))) {
++		return error;
++	}
++	emmc_reset_lines();
++
++	error = emmc_cmd(MMC_GO_IDLE, 0, CMD_RESP_NONE, 0, false, &r);
++	if (error) {
++		return error;
++	}
++	delay(2000);
++	uint64_t deadline = deadline_after(1 * NSEC_PER_SEC);
++	do {
++		error = emmc_cmd(MMC_SEND_OP_COND, OCR_ARG, CMD_R3, 0, false, &r);
++		if (error) {
++			return error;
++		}
++		if (r & OCR_BUSY) {
++			break;
++		}
++		delay(10000);
++	} while (mach_absolute_time() < deadline);
++	printf("ONCLITE EMMC: OCR 0x%x%s\n", r, (r & OCR_BUSY) ? "" : " (still busy)");
++	if (!(r & OCR_BUSY)) {
++		return ETIMEDOUT;
++	}
++	if ((error = emmc_cmd(MMC_ALL_SEND_CID, 0, CMD_R2, 0, false, &r))) {
++		return error;
++	}
++	uint32_t cid[4];
++	for (int i = 0; i < 4; i++) {
++		cid[i] = rd32(SDHCI_RESPONSE + 4 * i);
++	}
++	/* SDHCI R2: CID[127:8] in RESPONSE0-3 (CRC dropped); MID = CID[127:120]. */
++	printf("ONCLITE EMMC: CID manufacturer 0x%02x\n", (cid[3] >> 16) & 0xff);
++	if ((error = emmc_cmd(MMC_SET_RELATIVE_ADDR, arg, CMD_R1, 0, false, &r)) ||
++	    (error = emmc_cmd(MMC_SELECT_CARD, arg, CMD_R1B, 0, false, &r))) {
++		return error;
++	}
++	if ((error = emmc_switch(EXT_CSD_BUS_WIDTH, EXT_CSD_BUS_WIDTH_8))) {
++		return error;
++	}
++	wr8(SDHCI_HOST_CONTROL, (uint8_t)(rd8(SDHCI_HOST_CONTROL) | HCTL_8BIT));
++	if ((error = emmc_switch(EXT_CSD_HS_TIMING, EXT_CSD_TIMING_HS))) {
++		return error;
++	}
++	wr8(SDHCI_HOST_CONTROL, (uint8_t)(rd8(SDHCI_HOST_CONTROL) | HCTL_HISPD));
++	if ((error = emmc_set_clock(52000))) {
++		return error;
++	}
++	error = emmc_cmd(MMC_SEND_STATUS, arg, CMD_R1, 0, false, &r);
++	printf("ONCLITE EMMC: card RCA %u initialized: 8-bit High Speed, state %u (0x%x)\n",
++	    se.rca, R1_STATE(r), r);
++	return error ? error : (R1_STATE(r) == R1_STATE_TRAN ? 0 : EIO);
++}
++
++/* Use the card as LK left it if it is selected; otherwise identify it again. */
 +static int
 +emmc_wake_card(void)
 +{
-+	uint32_t r1 = 0, arg = se.rca << 16;
-+	int error = emmc_cmd(MMC_SEND_STATUS, arg, CMD_R1, 0, false, &r1);
++	uint32_t r1 = 0;
++	int error = emmc_cmd(MMC_SEND_STATUS, se.rca << 16, CMD_R1, 0, false, &r1);
 +	if (!error && R1_STATE(r1) == R1_STATE_TRAN) {
 +		printf("ONCLITE EMMC: card RCA %u already in transfer state (0x%x)\n", se.rca, r1);
 +		return 0;
 +	}
-+	if (error) {
-+		printf("ONCLITE EMMC: no status from RCA %u: assuming sleep, sending CMD5 awake\n", se.rca);
-+		error = emmc_cmd(MMC_SLEEP_AWAKE, arg, CMD_R1B, 0, false, &r1);
-+		if (error) {
-+			return error;
-+		}
-+	} else if (R1_STATE(r1) != R1_STATE_STBY) {
-+		printf("ONCLITE EMMC: card RCA %u in unexpected state %u (0x%x)\n", se.rca, R1_STATE(r1), r1);
-+		return EIO;
-+	}
-+	error = emmc_cmd(MMC_SELECT_CARD, arg, CMD_R1B, 0, false, &r1);
-+	if (error) {
-+		return error;
-+	}
-+	error = emmc_cmd(MMC_SEND_STATUS, arg, CMD_R1, 0, false, &r1);
-+	if (error) {
-+		return error;
-+	}
-+	printf("ONCLITE EMMC: card RCA %u selected, state %u (0x%x)\n", se.rca, R1_STATE(r1), r1);
-+	return R1_STATE(r1) == R1_STATE_TRAN ? 0 : EIO;
++	printf("ONCLITE EMMC: card not in transfer state (%d, 0x%x): identifying it again\n", error, r1);
++	return emmc_init_card();
 +}
 +
 +static int

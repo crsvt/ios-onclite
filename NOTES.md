@@ -146,6 +146,11 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   SDHCI bus power off, HS200 (UHS mode 3), card clock off. Caps 0x342dc8b2 = 1.8 V only. Driver now writes POWER 0x0A
   then 0x0B and acks each sdhci-msm PWRCTL request (core_mem +0xdc status, +0xe4 clear, +0xe8 ctl: bus success bit 0,
   io success bit 2), then enables the card clock.
+- **eMMC test C4 (18:49 UTC, CI 39303957858):** bus power on works (PWRCTL request 0x2 BUS_ON, acked 0x1, power 0xb),
+  card clock 0x7, but CMD13 and CMD5 (RCA 2) both CMD-timeout (status 0x18000): the card does not answer as LK left
+  it (HS200 sampling / RCA / state unknown). Driver now re-identifies the card from scratch like LK's own init:
+  host legacy 1-bit, SDHCI divider ~400 kHz (caps base 200 MHz; GCC stays LK's 192 MHz), CMD0, CMD1 (OCR 0x40ff8080)
+  until ready, CMD2, CMD3 (RCA 2), CMD7, CMD6 BUS_WIDTH=2 (8-bit), CMD6 HS_TIMING=1, divider 2 (~48 MHz).
 - Server (2026-10-19 18:25): 34.100.214.145, 22 GB free. Installed hfsprogs, android-sdk-libsparse-utils,
   linux-modules-extra-6.8.0-1070-gcp (hfsplus), cmake/fuse3 dev; apfs-fuse built (sgan81 66b86bd) ->
   /usr/local/bin. Work dir ~/ios-onclite-root/{tools,src,ipsw}. It stopped answering (no ssh, no ping) ~5 min after
