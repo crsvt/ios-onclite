@@ -106,6 +106,9 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
 - CI run 39282649111 (3045915): all patches applied; the only compile error (make -k, whole tree) was the
   hand-written `casa` in osfmk/arm/commpage/commpage_asm.s (PFZ trylocks, user mode) -> 0104 uses LDAXR/STXR when
   !__ARM_FEATURE_ATOMICS (sweet keeps casa). machine_routines_asm.s casa is under __ARM_ARCH_8_2__ (fine).
+- CI run 39285920519 (39973f3): BearSSL headers missing -> the staging scripts 0019/0020/0026 (libpthread,
+  BearSSL, HFS) exit early unless MACHINE_CONFIG == SWEET, so ONCLITE also lost patches 0031/0041 ("Skipping patch").
+  Fixed: they run for SWEET or ONCLITE.
 - Not done yet: xnu reboot via PS_HOLD (panic just stops; warm-reset by hand), display (Phase 3), eMMC root.
 - CI: `.github/workflows/xnu.yml` also triggers on branch `onclite-ci` with MACHINE_CONFIG=ONCLITE
   (-> kernel.development.onclite). crsvt/ios-onclite is PUBLIC: check pushes for serials/IMEI/calibration first.
