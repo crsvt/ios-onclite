@@ -63,6 +63,18 @@ Decision: run XNU with 16K pages on the gold cluster only. The shim boots on cpu
 there; cpus=4 (0x100-0x103); silver cores stay off (cpu0 CPU_OFF or WFI). No 4K-page XNU needed.
 Open: why LK ignores IMEM 0x77665502 (check PMIC PON_SOFT_RB_SPARE reboot reason); panel output after `fastboot boot`
 needs a DSI/panel re-enable or a flashed boot (ask the user first).
+User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get logs from Lineage instead
+(`adb root` works on this userdebug build), or hold Power + Volume up for TWRP.
+- **Probe v3-v5 (handoff, `logs/probe-v{3,4,5}.txt`):** every CPU_ON'd core enters at **EL1** (sweet's are EL2).
+  A core that already did CPU_OFF does NOT run after a second CPU_ON (returns 0, never starts, v3/v4) -> XNU must
+  never power cores off and back on (idle in WFI only). Cold handoff (v5) works: CPU_ON(0x100) -> gold core alive at EL1
+  after 1.28 ms; GICC is banked and starts disabled on the gold core (GICC_CTLR 0, enable per core); vtimer/ptimer
+  29 IRQs/300 ms on the gold core with cpu0 parked and again after cpu0 CPU_OFF (AFFINITY_INFO(0) = 1 OFF);
+  gold core then CPU_ONs 0x101-0x103 from cold, all EL1, MMFR0 0x101122. The XNU boot flow is proven in bare metal.
+- Local XNU compile checks: CI run 39158169212 (dipa-studio/ios-sweet @ fdad0de) build tree in `xnu/out-buildtree/`
+  (+ `ci.log`), its kernel in `xnu/out-sweet/`. `XNU_CC_CLANG=/usr/bin/clang python3 tools/xnu-cc.py
+  xnu/out-buildtree/ci.log xnu/out-buildtree FILE` works with the Command Line Tools clang (no ~/swift needed).
+  A full kernel build needs Xcode 15 + a KDK (Apple ID) or GitHub Actions (needs a push; user said do not push).
 
 ## Agent handoff / active work (2026-10-15, latest)
 

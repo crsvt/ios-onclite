@@ -52,6 +52,7 @@
 #define PSCI_CPU_SUSPEND	0xc4000001UL
 #define PSCI_CPU_OFF		0x84000002UL
 #define PSCI_CPU_ON		0xc4000003UL
+#define PSCI_AFFINITY_INFO	0xc4000004UL
 #define PSCI_MIGRATE_INFO_TYPE	0x84000006UL
 #define PSCI_SYSTEM_RESET	0x84000009UL
 #define PSCI_FEATURES		0x8400000aUL
@@ -123,7 +124,7 @@ static void px(uint32_t x, uint32_t y, uint8_t g)
 	}
 }
 
-static void con_clear(void)
+static void __attribute__((unused)) con_clear(void)
 {
 	for (uint32_t y = 0; y < fb_h; y++)
 		for (uint32_t x = 0; x < fb_w; x++)
@@ -334,7 +335,7 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 /* ---- CPU features ---- */
 
 struct cpu_regs {
-	uint64_t mpidr, midr, mmfr0, isar0, pfr0, done;
+	uint64_t mpidr, midr, mmfr0, isar0, pfr0, el, done;
 };
 static volatile struct cpu_regs cpu[NR_CPUS];
 
@@ -349,10 +350,20 @@ static void read_regs(volatile struct cpu_regs *r)
 	r->done = 1;
 }
 
-void secondary_main(uint64_t idx)
+static volatile uint32_t handoff;	/* set before cpu0 hands over to the gold core */
+static volatile uint32_t gold_alive, cpu0_go_off;
+static void gold_main(uint64_t entry_el);
+
+void secondary_main(uint64_t idx, uint64_t entry_el)
 {
+	cpu[idx].el = entry_el >> 2;
 	read_regs(&cpu[idx]);
 	dsb();
+	if (handoff && idx == 4)
+		gold_main(entry_el);
+	if (handoff)	/* gold cluster mates woken by the gold core: stay on */
+		for (;;)
+			__asm__ volatile("wfe");
 	smc(PSCI_CPU_OFF, 0, 0, 0);
 }
 
@@ -396,10 +407,15 @@ static void smp(void)
 	static const uint32_t mpidr[NR_CPUS] = { 0x000, 0x001, 0x002, 0x003, 0x100, 0x101, 0x102, 0x103 };
 	int64_t ret[NR_CPUS];
 
-	for (int i = 1; i < NR_CPUS; i++)
+	/*
+	 * v4: a core that did CPU_OFF does not run again after a second
+	 * CPU_ON (returns 0, never starts). Leave the gold cluster cold for
+	 * the handoff test and only cycle the silver cores here.
+	 */
+	for (int i = 1; i < 4; i++)
 		ret[i] = smc(PSCI_CPU_ON, mpidr[i], (uintptr_t)secondary_entry, i);
 	delay_ms(500);
-	for (int i = 1; i < NR_CPUS; i++) {
+	for (int i = 1; i < 4; i++) {
 		char label[] = "CPU0";
 		label[3] = '0' + i;
 		if (!cpu[i].done) {
@@ -408,6 +424,7 @@ static void smp(void)
 		}
 		/* mmfr0 bits 31:16 hold TGran4/64/16 and BigEndEL0; isar0 bits 23:20 atomics */
 		hex2(label, "mpidr=", cpu[i].mpidr, "m0=", (uint32_t)cpu[i].mmfr0);
+		hex2("", "entry EL=", cpu[i].el, 0, 0);
 		if (i == 4)
 			hex2("  A73?", "midr=", cpu[i].midr, "is0=", (uint32_t)cpu[i].isar0);
 	}
@@ -461,7 +478,7 @@ void probe_main(uint64_t dtb)
 {
 	stage = "start";
 	plog_init();
-	line("ONCLITE", "probe v2");
+	line("ONCLITE", "probe v5");
 	hex("DTB", dtb);
 	features();
 	psci();
@@ -473,11 +490,77 @@ void probe_main(uint64_t dtb)
 	hex2("FB", "addr=", fb, "pipe=", fb_pipe);
 	hex2("FB", "w=", fb_w, "h=", fb_h);
 	hex2("FB", "strd=", fb_stride, "fmt=", fb_fmt);
-	stage = "fb draw";
+	/*
+	 * Handoff: XNU will run on the gold cluster only (the silver cores
+	 * have no 16K granule). Wake MPIDR 0x100, switch cpu0 off and let the
+	 * gold core finish the test and reset.
+	 */
+	stage = "handoff";
 	line("STAGE", stage);
-	fb_ok = 1;
-	con_clear();
-	line("ONCLITE", "probe v2 done");
-	line("DONE", "all stages");
+	cpu[4].done = 0;
+	handoff = 1;
+	dsb();
+	int64_t r = smc(PSCI_CPU_ON, 0x100, (uintptr_t)secondary_entry, 4);
+	hex2("HANDOFF", "cpu_on=", (uint32_t)r, 0, 0);
+	if (r != 0)
+		reset_to(RESTART_RECOVERY, RESET_AFTER_S);
+	uint64_t t0 = now(), frq = rsr("cntfrq_el0");
+	while (!gold_alive && now() - t0 < frq)
+		;
+	hex2("CPU0", "gold alive=", gold_alive, "after us=", (uint32_t)((now() - t0) / (frq / 1000000)));
+	if (!gold_alive) {
+		hex2("CPU4", "done=", cpu[4].done, "el=", cpu[4].el);
+		hex2("CPU4", "aff=", smc(PSCI_AFFINITY_INFO, 0x100, 0, 0), 0, 0);
+		reset_to(RESTART_RECOVERY, RESET_AFTER_S);
+	}
+	line("CPU0", "parked");
+	/* Parked (WFE, IRQs masked) until the gold core asks for CPU_OFF. */
+	while (!cpu0_go_off)
+		__asm__ volatile("wfe");
+	line("CPU0", "CPU_OFF");
+	smc(PSCI_CPU_OFF, 0, 0, 0);
+	line("CPU0", "CPU_OFF returned");
+	for (;;)
+		__asm__ volatile("wfe");
+}
+
+static void gold_main(uint64_t entry_el)
+{
+	stage = "gold";
+	gold_alive = 1;
+	dsb();
+	delay_ms(50);	/* cpu0 logs its side first */
+	hex2("GOLD", "mpidr=", rsr("mpidr_el1"), "entryEL=", entry_el >> 2);
+	hex2("GOLD", "EL now=", rsr("CurrentEL") >> 2, "sctlr=", rsr("sctlr_el1"));
+	line("GOLD", "GIC test, cpu0 parked");
+	gic();
+	line("GOLD", "ask cpu0 CPU_OFF");
+	cpu0_go_off = 1;
+	dsb();
+	__asm__ volatile("sev");
+	/* 0 = ON, 1 = OFF, 2 = ON_PENDING; wait for cpu0 to finish CPU_OFF */
+	uint64_t st = 0;
+	for (int i = 0; i < 100; i++) {
+		st = smc(PSCI_AFFINITY_INFO, 0x000, 0, 0);
+		if (st == 1)
+			break;
+		delay_ms(10);
+	}
+	hex2("GOLD", "cpu0 aff=", (uint32_t)st, "(1 = off)", 0);
+	line("GOLD", "alone, GIC test again");
+	gic();
+	/* What XNU's SMP bring-up will do: wake the cluster mates from cold. */
+	static const uint32_t mates[3] = { 0x101, 0x102, 0x103 };
+	int64_t mr[3];
+	for (int i = 0; i < 3; i++)
+		mr[i] = smc(PSCI_CPU_ON, mates[i], (uintptr_t)secondary_entry, 5 + i);
+	delay_ms(300);
+	for (int i = 0; i < 3; i++) {
+		char label[] = "CPU5";
+		label[3] = '5' + i;
+		hex2(label, "ret=", (uint32_t)mr[i], "mpidr=", cpu[5 + i].done ? cpu[5 + i].mpidr : 0);
+		hex2("", "entry EL=", cpu[5 + i].el, "m0=", (uint32_t)cpu[5 + i].mmfr0);
+	}
+	line("DONE", "probe v5, all stages");
 	reset_to(RESTART_RECOVERY, RESET_AFTER_S);
 }

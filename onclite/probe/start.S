@@ -39,18 +39,46 @@ _start:
 3:	wfe
 	b	3b
 
-/* PSCI CPU_ON target. x0 = context id = cpu index (1..7). */
+/*
+ * PSCI CPU_ON target. x0 = context id = cpu index (1..7). If TZ starts the
+ * core at EL2, drop to EL1 (no stage 2, AArch64 EL1, no traps) like the
+ * XNU sweet secondary path. secondary_main gets (index, CurrentEL at entry).
+ */
 	.globl secondary_entry
 secondary_entry:
 	msr	daifset, #0xf
-	msr	spsel, #1
+	mov	x20, x0
+	mrs	x21, CurrentEL
+	cmp	x21, #0x8
+	b.ne	5f
+	mov	x1, #(1 << 31)		/* HCR_EL2.RW */
+	msr	hcr_el2, x1
+	msr	vttbr_el2, xzr
+	mov	x1, #0x33ff		/* CPTR_EL2 RES1 bits, no traps */
+	msr	cptr_el2, x1
+	msr	mdcr_el2, xzr
+	mov	x1, #3			/* EL1 physical timer/counter access */
+	msr	cnthctl_el2, x1
+	msr	cntvoff_el2, xzr
+	mov	x1, #0x0800		/* SCTLR_EL1: RES1 bits 29:28,23:22,20,11 */
+	movk	x1, #0x30d0, lsl #16
+	msr	sctlr_el1, x1
+	adr	x1, 5f
+	msr	elr_el2, x1
+	mov	x1, #0x3c5		/* DAIF masked, AArch64 EL1h */
+	msr	spsr_el2, x1
+	isb
+	eret
+5:	msr	spsel, #1
 	adr	x1, _sec_stacks
-	add	x1, x1, x0, lsl #12
+	add	x1, x1, x20, lsl #12
 	add	x1, x1, #0x1000
 	mov	sp, x1
 	adr	x1, vectors
 	msr	vbar_el1, x1
 	isb
+	mov	x0, x20
+	mov	x1, x21
 	bl	secondary_main
 4:	wfe
 	b	4b
