@@ -1,8 +1,8 @@
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..09cf515 100644
+index 0631685..9a59d7e 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -10,6 +10,199 @@
+@@ -10,6 +10,250 @@
  #include <IOKit/IODeviceTreeSupport.h>
  #include <IOKit/IOLib.h>
  
@@ -149,6 +149,57 @@ index 0631685..09cf515 100644
 +	IOLog("ONCLITE: SPMI PON channel not found\n");
 +}
 +
++/*
++ * Touch power check (read-only): print the state of PM8953 L6 (1.8 V, touch
++ * I/O and panel) and L10 (2.8 V, touch VDD), peripherals 0x45/0x49 on SID 1
++ * (LDOn at 0x4000 + (n - 1) * 0x100). Observer reads work for channels owned
++ * by any EE. STATUS1 0x08 bit 7 = VREG_READY, VSET 0x40/0x41, EN_CTL 0x46 bit 7.
++ */
++static void
++onclite_ldo_report(void)
++{
++	static const struct { const char *name; uint32_t ppid; } ldos[] = {
++		{ "L6", 0x145 }, { "L10", 0x149 },
++	};
++	vm_offset_t core = ml_io_map(SPMI_CORE_PA, 0x1000);
++	vm_offset_t cnfg = ml_io_map(SPMI_CNFG_PA, 0x1000);
++	if (!core || !cnfg) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(ldos) / sizeof(ldos[0]); i++) {
++		uint32_t apid;
++		for (apid = 0; SPMI_APID_MAP(apid) < 0x1000; apid++) {
++			uint32_t map = *(volatile uint32_t *)(core + SPMI_APID_MAP(apid));
++			if (map != 0 && ((map >> 8) & 0xfff) == ldos[i].ppid) {
++				break;
++			}
++		}
++		if (SPMI_APID_MAP(apid) >= 0x1000) {
++			IOLog("ONCLITE: PMIC %s (ppid 0x%x): no SPMI channel\n", ldos[i].name, ldos[i].ppid);
++			continue;
++		}
++		vm_offset_t obs = ml_io_map(SPMI_OBSRVR_PA + 0x8000 * apid, 0x1000);
++		if (!obs) {
++			continue;
++		}
++		static const uint8_t regs[] = { 0x04, 0x05, 0x08, 0x40, 0x41, 0x45, 0x46 };
++		uint8_t val[sizeof(regs)] = { 0 };
++		int rc = 0;
++		for (unsigned r = 0; r < sizeof(regs) && !rc; r++) {
++			*(volatile uint32_t *)(obs + SPMI_CMD) = (SPMI_OP_READL << 27) | ((uint32_t)regs[r] << 4);
++			rc = onclite_spmi_wait(obs);
++			if (!rc) {
++				val[r] = (uint8_t)*(volatile uint32_t *)(obs + SPMI_RDATA0);
++			}
++		}
++		IOLog("ONCLITE: PMIC %s channel %u owner EE %u (spmi %d): type 0x%02x/0x%02x status1 0x%02x "
++		    "vset 0x%02x%02x mode 0x%02x en_ctl 0x%02x -> %s\n",
++		    ldos[i].name, apid, *(volatile uint32_t *)(cnfg + SPMI_OWNER(apid)) & 7, rc,
++		    val[0], val[1], val[2], val[4], val[3], val[5], val[6],
++		    rc ? "unknown" : ((val[2] & 0x80) ? "ON" : "OFF"));
++	}
++}
++
 +static int
 +onclite_halt_restart(unsigned int type)
 +{
@@ -202,7 +253,7 @@ index 0631685..09cf515 100644
  class SweetPlatformExpert : public IODTPlatformExpert {
  	OSDeclareDefaultStructors(SweetPlatformExpert);
  
-@@ -31,6 +224,30 @@ SweetPlatformExpert::start(IOService *provider)
+@@ -31,6 +275,31 @@ SweetPlatformExpert::start(IOService *provider)
  	}
  	registerService();
  	IOLog("SWEET: platform expert registered\n");
@@ -212,6 +263,7 @@ index 0631685..09cf515 100644
 +	onclite_reset_mode = !strcmp(mode, "normal") ? LK_MODE_NORMAL :
 +	    !strcmp(mode, "fastboot") ? LK_MODE_FASTBOOT : LK_MODE_RECOVERY;
 +	onclite_spmi_init();
++	onclite_ldo_report();
 +	uint8_t spare = 0;
 +	int spmi_rc = onclite_pon_read(PON_SOFT_RB_SPARE, &spare);
 +	IOLog("ONCLITE: PON SOFT_RB_SPARE 0x%x (spmi %d), restarts go to LK mode %u\n",
