@@ -12,10 +12,10 @@ index 6630131..c06142b 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/onclite_emmc.c b/bsd/dev/onclite_emmc.c
 new file mode 100644
-index 0000000..9af777c
+index 0000000..7c1798c
 --- /dev/null
 +++ b/bsd/dev/onclite_emmc.c
-@@ -0,0 +1,1119 @@
+@@ -0,0 +1,1141 @@
 +/*
 + * onclite internal eMMC root device.
 + *
@@ -98,6 +98,16 @@ index 0000000..9af777c
 +#define SDHCI_ADMA_ADDRESS      0x58
 +#define SDHCI_ADMA_ADDRESS_HI   0x5c
 +#define SDHCI_HOST_VERSION      0xfe    /* 16 bit */
++
++/* Qualcomm vendor area of hc_mem (sdhci-msm "MCI present": host->ioaddr + offset) */
++#define SDCC_DLL_CONFIG         0x100
++#define SDCC_VENDOR_SPEC        0x10c
++#define DLL_RST                 (1u << 30)
++#define DLL_PDN                 (1u << 29)
++#define VS_HC_MCLK_SEL_MASK     (3u << 8)
++#define VS_HC_MCLK_SEL_DFLT     (2u << 8)
++#define VS_HC_SELECT_IN_EN      (1u << 18)
++#define VS_HC_SELECT_IN_MASK    (7u << 19)
 +
 +/* Qualcomm vendor registers ("core_mem", MCI present: qcom,sdhci-msm) */
 +#define SDCC_HC_MODE            0x78
@@ -585,6 +595,18 @@ index 0000000..9af777c
 +	/* Legacy timing on the host: 1-bit bus, no high speed, no UHS mode. */
 +	wr8(SDHCI_HOST_CONTROL, (uint8_t)(rd8(SDHCI_HOST_CONTROL) & ~(HCTL_4BIT | HCTL_8BIT | HCTL_HISPD)));
 +	wr16(SDHCI_HOST_CONTROL2, (uint16_t)(rd16(SDHCI_HOST_CONTROL2) & ~HCTL2_UHS_MASK));
++	/*
++	 * Below 100 MHz responses must use the feedback clock, not LK's HS200 DLL
++	 * path (sdhci-msm set_uhs_signaling / set_clock): DLL in reset and power
++	 * down, HC_SELECT_IN off, MCLK_SEL default.
++	 */
++	uint32_t vs = rd32(SDCC_VENDOR_SPEC), dll = rd32(SDCC_DLL_CONFIG);
++	wr32(SDCC_VENDOR_SPEC, (vs & ~(VS_HC_SELECT_IN_EN | VS_HC_SELECT_IN_MASK | VS_HC_MCLK_SEL_MASK)) |
++	    VS_HC_MCLK_SEL_DFLT);
++	wr32(SDCC_DLL_CONFIG, dll | DLL_RST | DLL_PDN);
++	__builtin_arm_dsb(0xf);
++	printf("ONCLITE EMMC: VENDOR_SPEC 0x%x -> 0x%x, DLL_CONFIG 0x%x -> 0x%x\n",
++	    vs, rd32(SDCC_VENDOR_SPEC), dll, rd32(SDCC_DLL_CONFIG));
 +	if ((error = emmc_set_clock(400))) {
 +		return error;
 +	}
