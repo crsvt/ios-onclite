@@ -263,6 +263,10 @@ def build(seed=None, qemu=False, highmem=False, onclite=False):
         # zone is fixed in the kernel, the node only enables it. No fbcon (LK
         # switches the panel off for fastboot boot), no UFS (eMMC phone).
         ramoops = node('sweet-ramoops', [ph(), ('reg', u64(0x91400000, 0x200000))])
+        # bsd/dev/onclite_emmc.c: the SDHCI host LK leaves running (sdhci@7824900
+        # "hc_mem"; absolute physical reg like /sweet-ufs).
+        emmc = node('onclite-emmc', [ph(), ('compatible', cstr('qcom,sdhci-msm')),
+                                     ('reg', u64(0x07824900, 0x500))])
         return node('device-tree', [
             ph(),
             ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,onclite') + cstr('qcom,sdm632') + cstr('AppleARM')),
@@ -272,7 +276,7 @@ def build(seed=None, qemu=False, highmem=False, onclite=False):
             ('manufacturer', cstr('Apple Inc.')),
             ('#address-cells', u32(2)),
             ('#size-cells', u32(2)),
-        ], [chosen, defaults, cpus, arm_io, ramoops, buttons] + product)
+        ], [chosen, defaults, cpus, arm_io, ramoops, emmc, buttons] + product)
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product

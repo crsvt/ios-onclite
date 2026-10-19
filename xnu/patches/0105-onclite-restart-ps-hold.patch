@@ -1,0 +1,80 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..391a5a8 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -10,6 +10,53 @@
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
+ 
++#if defined(ONCLITE)
++#include <machine/atomic.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++
++/*
++ * onclite: restart through PS_HOLD (DT qcom,pshold restart@4ab000). PSCI
++ * SYSTEM_RESET just returns on this TZ (shim tests); dropping PS_HOLD makes
++ * the PMIC reset the SoC with DRAM kept, so the ramoops console survives and
++ * LK boots Linux, where the record is /sys/fs/pstore/console-ramoops-0.
++ * Panics reach this with a debug= value without DB_NMI (0x4), e.g. 0x8.
++ * Boot-arg onclite_reboot_after=N restarts N seconds after the platform
++ * expert starts, for unattended tests.
++ */
++#define ONCLITE_PSHOLD_PA       0x004ab000UL
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++
++static volatile uint32_t *onclite_pshold;
++
++static int
++onclite_halt_restart(unsigned int type)
++{
++	if (type == kPEPanicSync || type == kPEPanicDiagnosticsDone || type == kPEPanicBegin ||
++	    type == kPEPanicEnd || onclite_pshold == NULL) {
++		return 0;
++	}
++	kprintf("ONCLITE: restart (type %u) via PS_HOLD\n", type);
++	__builtin_arm_dsb(DSB_SY);
++	*onclite_pshold = 0;
++	__builtin_arm_dsb(DSB_SY);
++	for (;;) {
++		__builtin_arm_wfe();
++	}
++}
++
++static void
++onclite_reboot_timer(void *arg, wait_result_t wr __unused)
++{
++	uint32_t secs = (uint32_t)(uintptr_t)arg;
++	IOSleep(secs * 1000);
++	IOLog("ONCLITE: onclite_reboot_after=%u expired, restarting\n", secs);
++	PEHaltRestart(kPERestartCPU);
++}
++#endif /* ONCLITE */
++
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+ 
+@@ -31,6 +78,21 @@ SweetPlatformExpert::start(IOService *provider)
+ 	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
++#if defined(ONCLITE)
++	onclite_pshold = (volatile uint32_t *)ml_io_map(ONCLITE_PSHOLD_PA, PAGE_SIZE);
++	if (onclite_pshold != NULL) {
++		PE_halt_restart = onclite_halt_restart;
++	}
++	uint32_t secs = 0;
++	if (PE_parse_boot_argn("onclite_reboot_after", &secs, sizeof(secs)) && secs != 0) {
++		thread_t thread;
++		if (kernel_thread_start(onclite_reboot_timer, (void *)(uintptr_t)secs, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
++	}
++	IOLog("ONCLITE: restart via PS_HOLD %s, reboot timer %u s\n",
++	    onclite_pshold != NULL ? "ready" : "UNAVAILABLE", secs);
++#endif
+ 	return true;
+ }
+ 

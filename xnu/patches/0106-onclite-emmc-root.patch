@@ -1,0 +1,892 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..c06142b 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/onclite_emmc.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/onclite_emmc.c b/bsd/dev/onclite_emmc.c
+new file mode 100644
+index 0000000..d1373bc
+--- /dev/null
++++ b/bsd/dev/onclite_emmc.c
+@@ -0,0 +1,846 @@
++/*
++ * onclite internal eMMC root device.
++ *
++ * The Redmi 7 boots from eMMC behind a Qualcomm SDHCI host (sdhci-msm,
++ * "hc_mem" at 0x7824900). LK loaded our boot image through it and leaves the
++ * controller powered and clocked with the card selected in transfer state.
++ * This driver reuses that state like sweet_ufs.c does for UFS: it switches
++ * the host to ADMA2 (32-bit; all kernel RAM is below 4 GiB), keeps LK's bus
++ * width, timing and clock, and issues polled CMD17/18 and CMD24/25 (auto
++ * CMD12) to the user data area. It finds one GPT partition by name (boot-arg
++ * emmcroot=, default "userdata") and exposes it as the BSD disk emmcroot0
++ * (remmcroot0). Root on it with rd=emmcroot0.
++ *
++ * All DMA goes through one physically contiguous allocation (descriptor
++ * table and a 1 MiB bounce buffer); the host is not cache coherent, so caches
++ * are cleaned/invalidated around each command.
++ *
++ * Writes are refused unless boot-arg emmcrw=1 is set. Every write is checked
++ * against the partition bounds again right before it is issued, so nothing
++ * outside the named partition can be written. Boot-arg emmctest=1 lists the
++ * GPT and prints the SHA-256 of a few small partitions (to compare with the
++ * backups) and then stops: the root is reported as unavailable.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ONCLITE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++#include <libkern/crypto/sha2.h>
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++/* SD Host Controller Simplified Specification 3.00 */
++#define SDHCI_ADMA_SYS_ADDR     0x00
++#define SDHCI_BLOCK_SIZE        0x04    /* 16 bit */
++#define SDHCI_BLOCK_COUNT       0x06    /* 16 bit */
++#define SDHCI_ARGUMENT          0x08
++#define SDHCI_TRANSFER_MODE     0x0c    /* 16 bit */
++#define SDHCI_COMMAND           0x0e    /* 16 bit, writing it issues the command */
++#define SDHCI_RESPONSE          0x10
++#define SDHCI_PRESENT_STATE     0x24
++#define SDHCI_HOST_CONTROL      0x28    /* 8 bit */
++#define SDHCI_CLOCK_CONTROL     0x2c    /* 16 bit */
++#define SDHCI_TIMEOUT_CONTROL   0x2e    /* 8 bit */
++#define SDHCI_SOFTWARE_RESET    0x2f    /* 8 bit */
++#define SDHCI_INT_STATUS        0x30    /* normal [15:0], error [31:16] */
++#define SDHCI_INT_ENABLE        0x34
++#define SDHCI_SIGNAL_ENABLE     0x38
++#define SDHCI_CAPABILITIES      0x40
++#define SDHCI_ADMA_ADDRESS      0x58
++#define SDHCI_ADMA_ADDRESS_HI   0x5c
++#define SDHCI_HOST_VERSION      0xfe    /* 16 bit */
++
++#define PRES_CMD_INHIBIT        (1u << 0)
++#define PRES_DATA_INHIBIT       (1u << 1)
++#define PRES_DAT0               (1u << 20)
++
++#define HCTL_DMA_MASK           (3u << 3)
++#define HCTL_ADMA2_32           (2u << 3)
++
++#define CLK_INT_STABLE          (1u << 1)
++#define CLK_SD_EN               (1u << 2)
++
++#define RESET_CMD               (1u << 1)
++#define RESET_DATA              (1u << 2)
++
++#define INT_CMD_COMPLETE        (1u << 0)
++#define INT_XFER_COMPLETE       (1u << 1)
++#define INT_DMA                 (1u << 3)
++#define INT_ERROR               (1u << 15)
++#define INT_ERROR_MASK          0xffff0000u
++#define INT_ENABLE_ALL          (0x03ff0000u | INT_DMA | INT_XFER_COMPLETE | INT_CMD_COMPLETE)
++
++#define CAP_ADMA2               (1u << 19)
++
++#define TM_DMA                  (1u << 0)
++#define TM_BLK_CNT_EN           (1u << 1)
++#define TM_AUTO_CMD12           (1u << 2)
++#define TM_READ                 (1u << 4)
++#define TM_MULTI                (1u << 5)
++
++#define CMD_RESP_NONE           0u
++#define CMD_RESP_48             2u
++#define CMD_RESP_48_BUSY        3u
++#define CMD_CRC                 (1u << 3)
++#define CMD_INDEX               (1u << 4)
++#define CMD_DATA                (1u << 5)
++#define CMD_R1                  (CMD_RESP_48 | CMD_CRC | CMD_INDEX)
++#define CMD_R1B                 (CMD_RESP_48_BUSY | CMD_CRC | CMD_INDEX)
++
++#define MMC_SWITCH              6
++#define MMC_SEND_EXT_CSD        8
++#define MMC_READ_SINGLE         17
++#define MMC_READ_MULTIPLE       18
++#define MMC_WRITE_SINGLE        24
++#define MMC_WRITE_MULTIPLE      25
++
++/*
++ * R1 card status error bits (JESD84-B51 6.13): ADDRESS_OUT_OF_RANGE 31,
++ * ADDRESS_MISALIGN 30, BLOCK_LEN_ERROR 29, ERASE_SEQ_ERROR 28, ERASE_PARAM 27,
++ * WP_VIOLATION 26, LOCK_UNLOCK_FAILED 24, COM_CRC_ERROR 23, ILLEGAL_COMMAND 22,
++ * CARD_ECC_FAILED 21, CC_ERROR 20, ERROR 19, CID/CSD_OVERWRITE 16,
++ * WP_ERASE_SKIP 15, SWITCH_ERROR 7.
++ */
++#define R1_ERRORS               0xfdf98080u
++
++#define EXT_CSD_CACHE_CTRL      33
++#define EXT_CSD_FLUSH_CACHE     32
++#define EXT_CSD_PART_CONFIG     179
++#define EXT_CSD_BUS_WIDTH       183
++#define EXT_CSD_HS_TIMING       185
++#define EXT_CSD_REV             192
++#define EXT_CSD_SEC_CNT         212
++
++#define EMMC_BLOCK              512u
++#define BOUNCE_SIZE             (1u << 20)
++#define ADMA_CHUNK              (32u << 10)     /* < 64 KiB: no length-0 ambiguity */
++#define ADMA_MAX                (BOUNCE_SIZE / ADMA_CHUNK)
++#define CMD_TIMEOUT_NS          (5ull * NSEC_PER_SEC)
++
++#define ADMA_VALID              (1u << 0)
++#define ADMA_END                (1u << 1)
++#define ADMA_ACT_TRAN           (2u << 4)
++
++struct adma2_desc {
++	uint16_t attr;
++	uint16_t len;
++	uint32_t addr;
++};
++
++/* Layout of the contiguous DMA allocation. */
++#define DMA_ADMA                0x0000          /* 4 byte aligned table */
++#define DMA_BOUNCE              0x4000
++#define DMA_SIZE                (DMA_BOUNCE + BOUNCE_SIZE)
++
++static struct {
++	vm_offset_t regs;
++	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
++	uint64_t dma_pa;
++	uint64_t card_sectors;                  /* whole user area, 512-byte sectors */
++	uint64_t first_block, nblocks;          /* partition, in 512-byte sectors */
++	uint32_t secsize;                       /* logical sector size for the BSD layer */
++	bool cache_on;                          /* EXT_CSD CACHE_CTRL */
++	bool writable;                          /* boot-arg emmcrw=1 */
++	int bmajor, cmajor;
++	dev_t bdev;
++	bool ready;
++} se;
++
++static LCK_GRP_DECLARE(onclite_emmc_grp, "onclite_emmc");
++static LCK_MTX_DECLARE(onclite_emmc_lock, &onclite_emmc_grp);
++
++static inline uint32_t
++rd32(uint32_t off)
++{
++	return *(volatile uint32_t *)(se.regs + off);
++}
++
++static inline uint16_t
++rd16(uint32_t off)
++{
++	return *(volatile uint16_t *)(se.regs + off);
++}
++
++static inline uint8_t
++rd8(uint32_t off)
++{
++	return *(volatile uint8_t *)(se.regs + off);
++}
++
++static inline void
++wr32(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(se.regs + off) = v;
++}
++
++static inline void
++wr16(uint32_t off, uint16_t v)
++{
++	*(volatile uint16_t *)(se.regs + off) = v;
++}
++
++static inline void
++wr8(uint32_t off, uint8_t v)
++{
++	*(volatile uint8_t *)(se.regs + off) = v;
++}
++
++static void
++dma_sync(uint32_t off, uint32_t len)
++{
++	flush_dcache64((addr64_t)(se.dma_pa + off), len, TRUE);
++}
++
++static uint64_t
++deadline_after(uint64_t ns)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime(ns, &t);
++	return mach_absolute_time() + t;
++}
++
++/* Reset the CMD and DATA state machines only: clock, bus width and timing stay. */
++static void
++emmc_reset_lines(void)
++{
++	wr8(SDHCI_SOFTWARE_RESET, RESET_CMD | RESET_DATA);
++	uint64_t deadline = deadline_after(100 * NSEC_PER_MSEC);
++	while (rd8(SDHCI_SOFTWARE_RESET) & (RESET_CMD | RESET_DATA)) {
++		if (mach_absolute_time() > deadline) {
++			printf("ONCLITE EMMC: line reset did not complete\n");
++			break;
++		}
++		delay(1);
++	}
++	wr32(SDHCI_INT_STATUS, 0xffffffffu);
++}
++
++/* Wait for any of the bits in want; returns 0, EIO (error status) or ETIMEDOUT. */
++static int
++emmc_wait(uint32_t want, uint32_t *status_out)
++{
++	uint64_t deadline = deadline_after(CMD_TIMEOUT_NS);
++	uint32_t status;
++	for (;;) {
++		status = rd32(SDHCI_INT_STATUS);
++		if (status & (INT_ERROR | INT_ERROR_MASK)) {
++			*status_out = status;
++			return EIO;
++		}
++		if ((status & want) == want) {
++			*status_out = status;
++			return 0;
++		}
++		if (mach_absolute_time() > deadline) {
++			*status_out = status;
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++}
++
++/*
++ * One command. With count != 0, count blocks of EMMC_BLOCK move between the
++ * card and the bounce buffer (to the card when write is set) by ADMA2.
++ * resp_flags is CMD_R1 or CMD_R1B. Returns 0 or an errno; *r1 = response.
++ */
++static int
++emmc_cmd(uint8_t index, uint32_t arg, uint32_t resp_flags, uint32_t count, bool write, uint32_t *r1)
++{
++	uint32_t status = 0, len = count * EMMC_BLOCK;
++	uint64_t deadline = deadline_after(CMD_TIMEOUT_NS);
++
++	assert(len <= BOUNCE_SIZE);
++	while (rd32(SDHCI_PRESENT_STATE) & (PRES_CMD_INHIBIT | PRES_DATA_INHIBIT)) {
++		if (mach_absolute_time() > deadline) {
++			printf("ONCLITE EMMC: host busy before CMD%u (present 0x%x)\n",
++			    index, rd32(SDHCI_PRESENT_STATE));
++			emmc_reset_lines();
++			return EBUSY;
++		}
++		delay(1);
++	}
++	wr32(SDHCI_INT_STATUS, 0xffffffffu);
++
++	uint16_t mode = 0;
++	if (count) {
++		struct adma2_desc *d = (struct adma2_desc *)(se.dma + DMA_ADMA);
++		uint32_t n = 0;
++		for (uint32_t done = 0; done < len; done += ADMA_CHUNK, n++) {
++			uint32_t chunk = MIN(ADMA_CHUNK, len - done);
++			d[n].addr = (uint32_t)(se.dma_pa + DMA_BOUNCE + done);
++			d[n].len = (uint16_t)chunk;
++			d[n].attr = ADMA_VALID | ADMA_ACT_TRAN;
++		}
++		d[n - 1].attr |= ADMA_END;
++		dma_sync(DMA_ADMA, n * sizeof(*d));
++		dma_sync(DMA_BOUNCE, len);
++		__builtin_arm_dsb(0xf);
++
++		uint64_t table = se.dma_pa + DMA_ADMA;
++		wr32(SDHCI_ADMA_ADDRESS, (uint32_t)table);
++		wr32(SDHCI_ADMA_ADDRESS_HI, (uint32_t)(table >> 32));
++		wr16(SDHCI_BLOCK_SIZE, (uint16_t)EMMC_BLOCK);
++		wr16(SDHCI_BLOCK_COUNT, (uint16_t)count);
++		mode = TM_DMA | TM_BLK_CNT_EN | (write ? 0 : TM_READ);
++		if (count > 1) {
++			mode |= TM_MULTI | TM_AUTO_CMD12;
++		}
++	}
++	wr32(SDHCI_ARGUMENT, arg);
++	wr16(SDHCI_TRANSFER_MODE, mode);
++	wr16(SDHCI_COMMAND, (uint16_t)((index << 8) | resp_flags | (count ? CMD_DATA : 0)));
++
++	int error = emmc_wait(INT_CMD_COMPLETE, &status);
++	if (!error) {
++		*r1 = rd32(SDHCI_RESPONSE);
++		if (count || (resp_flags & CMD_RESP_48_BUSY) == CMD_RESP_48_BUSY) {
++			/* Data done, or busy (DAT0) released for R1b. */
++			error = emmc_wait(INT_XFER_COMPLETE, &status);
++		}
++	}
++	if (count && !error) {
++		dma_sync(DMA_BOUNCE, len);
++	}
++	if (error) {
++		printf("ONCLITE EMMC: CMD%u arg 0x%x blocks %u failed (%d): status 0x%x present 0x%x\n",
++		    index, arg, count, error, status, rd32(SDHCI_PRESENT_STATE));
++		emmc_reset_lines();
++		return error;
++	}
++	wr32(SDHCI_INT_STATUS, status);
++	if (*r1 & R1_ERRORS) {
++		printf("ONCLITE EMMC: CMD%u card status 0x%x\n", index, *r1);
++		return EIO;
++	}
++	return 0;
++}
++
++/* count sectors at lba into the bounce buffer. */
++static int
++emmc_read_blocks(uint64_t lba, uint32_t count)
++{
++	uint32_t r1;
++	if (count == 0 || count > BOUNCE_SIZE / EMMC_BLOCK || lba + count > se.card_sectors ||
++	    lba > UINT32_MAX) {
++		return EINVAL;
++	}
++	return emmc_cmd(count > 1 ? MMC_READ_MULTIPLE : MMC_READ_SINGLE, (uint32_t)lba, CMD_R1,
++	           count, false, &r1);
++}
++
++/*
++ * count sectors from the bounce buffer to lba. The range must lie inside the
++ * partition: this is the only place data goes out.
++ */
++static int
++emmc_write_blocks(uint64_t lba, uint32_t count)
++{
++	uint32_t r1;
++	if (!se.writable || !se.nblocks || count == 0 || count > BOUNCE_SIZE / EMMC_BLOCK ||
++	    lba < se.first_block || lba - se.first_block >= se.nblocks ||
++	    count > se.nblocks - (lba - se.first_block) || lba + count - 1 > UINT32_MAX) {
++		printf("ONCLITE EMMC: refusing write of %u blocks at 0x%llx\n", count, lba);
++		return EPERM;
++	}
++	int error = emmc_cmd(count > 1 ? MMC_WRITE_MULTIPLE : MMC_WRITE_SINGLE, (uint32_t)lba, CMD_R1,
++	    count, true, &r1);
++	if (!error) {
++		/* Programming finishes with DAT0 high. */
++		uint64_t deadline = deadline_after(CMD_TIMEOUT_NS);
++		while (!(rd32(SDHCI_PRESENT_STATE) & PRES_DAT0)) {
++			if (mach_absolute_time() > deadline) {
++				printf("ONCLITE EMMC: card busy after write at 0x%llx\n", lba);
++				return ETIMEDOUT;
++			}
++			delay(1);
++		}
++	}
++	return error;
++}
++
++/* CMD6 WRITE_BYTE of one EXT_CSD byte (R1b). */
++static int
++emmc_switch(uint8_t index, uint8_t value)
++{
++	uint32_t r1;
++	return emmc_cmd(MMC_SWITCH, (3u << 24) | ((uint32_t)index << 16) | ((uint32_t)value << 8),
++	           CMD_R1B, 0, false, &r1);
++}
++
++static int
++emmc_flush(void)
++{
++	return se.cache_on ? emmc_switch(EXT_CSD_FLUSH_CACHE, 1) : 0;
++}
++
++static int
++emmc_take_over_host(void)
++{
++	uint16_t version = rd16(SDHCI_HOST_VERSION), clk = rd16(SDHCI_CLOCK_CONTROL);
++	uint32_t caps = rd32(SDHCI_CAPABILITIES), present = rd32(SDHCI_PRESENT_STATE);
++	uint8_t hctl = rd8(SDHCI_HOST_CONTROL);
++
++	printf("ONCLITE EMMC: SDHCI version 0x%x caps 0x%x present 0x%x host 0x%x clock 0x%x\n",
++	    version, caps, present, hctl, clk);
++	if (!(clk & CLK_INT_STABLE) || !(clk & CLK_SD_EN)) {
++		printf("ONCLITE EMMC: bootloader left the card clock off\n");
++		return ENXIO;
++	}
++	if (!(caps & CAP_ADMA2)) {
++		printf("ONCLITE EMMC: host has no ADMA2\n");
++		return ENXIO;
++	}
++	if (present & (PRES_CMD_INHIBIT | PRES_DATA_INHIBIT)) {
++		emmc_reset_lines();
++	}
++	wr32(SDHCI_SIGNAL_ENABLE, 0);           /* polled operation */
++	wr32(SDHCI_INT_ENABLE, INT_ENABLE_ALL);
++	wr32(SDHCI_INT_STATUS, 0xffffffffu);
++	wr8(SDHCI_TIMEOUT_CONTROL, 0x0e);       /* longest data timeout */
++	/* Keep LK's bus width and high-speed bits; select ADMA2 32-bit. */
++	wr8(SDHCI_HOST_CONTROL, (uint8_t)((hctl & ~HCTL_DMA_MASK) | HCTL_ADMA2_32));
++	if ((rd8(SDHCI_HOST_CONTROL) & HCTL_DMA_MASK) != HCTL_ADMA2_32) {
++		printf("ONCLITE EMMC: host did not take ADMA2\n");
++		return EIO;
++	}
++	return 0;
++}
++
++static int
++emmc_read_ext_csd(void)
++{
++	uint32_t r1;
++	int error = emmc_cmd(MMC_SEND_EXT_CSD, 0, CMD_R1, 1, false, &r1);
++	if (error) {
++		return error;
++	}
++	const uint8_t *e = (const uint8_t *)(se.dma + DMA_BOUNCE);
++	uint32_t sectors;
++	memcpy(&sectors, e + EXT_CSD_SEC_CNT, 4);
++	se.card_sectors = sectors;
++	se.cache_on = e[EXT_CSD_CACHE_CTRL] & 1;
++	uint8_t part = e[EXT_CSD_PART_CONFIG];
++	printf("ONCLITE EMMC: EXT_CSD rev %u, %u sectors (%llu MiB), bus width %u, timing %u, "
++	    "partition config 0x%x, cache %s\n", e[EXT_CSD_REV], sectors, (uint64_t)sectors >> 11,
++	    e[EXT_CSD_BUS_WIDTH], e[EXT_CSD_HS_TIMING], part, se.cache_on ? "on" : "off");
++	if (sectors == 0) {
++		return ENXIO;
++	}
++	if (part & 7) {
++		/* Make sure every access goes to the user data area, not a boot partition. */
++		printf("ONCLITE EMMC: switching partition access %u -> user area\n", part & 7);
++		error = emmc_switch(EXT_CSD_PART_CONFIG, part & ~7);
++	}
++	return error;
++}
++
++/* GPT entry name (UTF-16LE, ASCII only) into name[37]. */
++static void
++gpt_name(const uint8_t *e, char *name)
++{
++	unsigned c;
++	for (c = 0; c < 36; c++) {
++		uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++		if (ch == 0 || ch > 0x7f) {
++			break;
++		}
++		name[c] = (char)ch;
++	}
++	name[c] = 0;
++}
++
++/*
++ * Walk the primary GPT. With want != NULL record that partition; with
++ * part_lba/part_count != NULL return the bounds of `want` without changing se.
++ */
++static int
++emmc_gpt(const char *want, bool list, uint64_t *part_lba, uint64_t *part_count)
++{
++	const uint8_t *b = (const uint8_t *)(se.dma + DMA_BOUNCE);
++	int error = emmc_read_blocks(1, 1);
++	if (error) {
++		return error;
++	}
++	if (memcmp(b, "EFI PART", 8) != 0) {
++		printf("ONCLITE EMMC: no GPT\n");
++		return ENXIO;
++	}
++	uint64_t entry_lba;
++	uint32_t nent, esz;
++	memcpy(&entry_lba, b + 72, 8);
++	memcpy(&nent, b + 80, 4);
++	memcpy(&esz, b + 84, 4);
++	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
++		printf("ONCLITE EMMC: unsupported GPT entries %u x %u\n", nent, esz);
++		return ENXIO;
++	}
++	error = emmc_read_blocks(entry_lba, (nent * esz + EMMC_BLOCK - 1) / EMMC_BLOCK);
++	if (error) {
++		return error;
++	}
++	int found = ENOENT;
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = b + i * esz;
++		uint64_t first, last;
++		char name[37];
++		memcpy(&first, e + 32, 8);
++		memcpy(&last, e + 40, 8);
++		if (first == 0 && last == 0) {
++			continue;
++		}
++		gpt_name(e, name);
++		if (list) {
++			printf("ONCLITE EMMC: GPT %2u %-16s first 0x%llx sectors 0x%llx (%llu KiB)\n",
++			    i, name, first, last - first + 1, (last - first + 1) / 2);
++		}
++		if (want != NULL && strcmp(name, want) == 0 && last >= first && last < se.card_sectors) {
++			*part_lba = first;
++			*part_count = last - first + 1;
++			found = 0;
++		}
++	}
++	if (want != NULL && found) {
++		printf("ONCLITE EMMC: no GPT partition named \"%s\"\n", want);
++	}
++	return found;
++}
++
++/* emmctest=1: SHA-256 of whole small partitions, to compare with backup/SHA256SUMS. */
++static void
++emmc_selftest(void)
++{
++	static const char *const parts[] = { "fsc", "vbmeta", "dtbo" };
++
++	emmc_gpt(NULL, true, NULL, NULL);
++	for (unsigned p = 0; p < sizeof(parts) / sizeof(parts[0]); p++) {
++		uint64_t lba, count;
++		if (emmc_gpt(parts[p], false, &lba, &count)) {
++			continue;
++		}
++		SHA256_CTX ctx;
++		SHA256_Init(&ctx);
++		int error = 0;
++		for (uint64_t done = 0; done < count && !error;) {
++			uint32_t n = (uint32_t)MIN(count - done, (uint64_t)(BOUNCE_SIZE / EMMC_BLOCK));
++			error = emmc_read_blocks(lba + done, n);
++			if (!error) {
++				SHA256_Update(&ctx, (const void *)(se.dma + DMA_BOUNCE), n * EMMC_BLOCK);
++			}
++			done += n;
++		}
++		uint8_t digest[SHA256_DIGEST_LENGTH];
++		SHA256_Final(digest, &ctx);
++		char hex[2 * SHA256_DIGEST_LENGTH + 1];
++		for (unsigned i = 0; i < SHA256_DIGEST_LENGTH; i++) {
++			snprintf(hex + 2 * i, 3, "%02x", digest[i]);
++		}
++		printf("ONCLITE EMMC: sha256 %s  %s.img (%llu bytes)%s\n", hex, parts[p],
++		    count * EMMC_BLOCK, error ? " READ ERROR" : "");
++	}
++}
++
++static int
++onclite_emmc_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (!se.ready) {
++		return ENXIO;
++	}
++	return ((flags & FWRITE) && !se.writable) ? EROFS : 0;
++}
++
++static int
++onclite_emmc_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++onclite_emmc_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * se.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = se.nblocks * EMMC_BLOCK;
++
++	bool rd = buf_flags(bp) & B_READ;
++
++	buf_setresid(bp, count);
++	if (!rd && !se.writable) {
++		error = EROFS;
++		goto done;
++	}
++	if (off > part_bytes || count > part_bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++
++	lck_mtx_lock(&onclite_emmc_lock);
++	for (uint32_t done = 0; done < count;) {
++		uint64_t pos = off + done;
++		uint64_t lba = pos / EMMC_BLOCK;
++		uint32_t skip = (uint32_t)(pos % EMMC_BLOCK);
++		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
++		uint32_t blocks = (skip + want + EMMC_BLOCK - 1) / EMMC_BLOCK;
++		void *bounce = (void *)(se.dma + DMA_BOUNCE);
++		if (rd) {
++			error = emmc_read_blocks(se.first_block + lba, blocks);
++			if (!error) {
++				memcpy(vaddr + done, (const char *)bounce + skip, want);
++			}
++		} else {
++			/* Partial sectors at either end: read, merge, write back. */
++			if (skip || (want % EMMC_BLOCK)) {
++				error = emmc_read_blocks(se.first_block + lba, blocks);
++			}
++			if (!error) {
++				memcpy((char *)bounce + skip, vaddr + done, want);
++				error = emmc_write_blocks(se.first_block + lba, blocks);
++			}
++		}
++		if (error) {
++			break;
++		}
++		done += want;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&onclite_emmc_lock);
++	buf_unmap(bp);
++
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++onclite_emmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = se.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		if (*f < DEV_BSIZE || *f > 4096 || (*f & (*f - 1))) {
++			return EINVAL;
++		}
++		se.secsize = *f;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = EMMC_BLOCK;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = se.nblocks * EMMC_BLOCK / se.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = se.writable;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE: {
++		if (!se.writable) {
++			return 0;
++		}
++		lck_mtx_lock(&onclite_emmc_lock);
++		int error = emmc_flush();
++		lck_mtx_unlock(&onclite_emmc_lock);
++		return error;
++	}
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = BOUNCE_SIZE / se.secsize;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = se.writable ? BOUNCE_SIZE / se.secsize : 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++onclite_emmc_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return onclite_emmc_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++onclite_emmc_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return onclite_emmc_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++onclite_emmc_psize(__unused dev_t dev)
++{
++	return se.ready ? (int)MIN(se.nblocks * EMMC_BLOCK / se.secsize, INT_MAX) : -1;
++}
++
++static int
++onclite_emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(onclite_emmc_strategy, NULL, dev, B_READ, minphys, uio, (int)se.secsize);
++}
++
++static int
++onclite_emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	if (!se.writable) {
++		return EROFS;
++	}
++	return physio(onclite_emmc_strategy, NULL, dev, B_WRITE, minphys, uio, (int)se.secsize);
++}
++
++static const struct bdevsw onclite_emmc_bdevsw = {
++	.d_open     = onclite_emmc_open,
++	.d_close    = onclite_emmc_close,
++	.d_strategy = onclite_emmc_strategy,
++	.d_ioctl    = onclite_emmc_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = onclite_emmc_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw onclite_emmc_cdevsw = {
++	.d_open       = onclite_emmc_open,
++	.d_close      = onclite_emmc_close,
++	.d_read       = onclite_emmc_read,
++	.d_write      = onclite_emmc_write,
++	.d_ioctl      = onclite_emmc_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++static int
++onclite_emmc_init(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	char want[64] = "userdata";
++	int error;
++
++	if (SecureDTLookupEntry(NULL, "/onclite-emmc", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("ONCLITE EMMC: no /onclite-emmc node in the device tree\n");
++		return ENXIO;
++	}
++	PE_parse_boot_argn("emmcroot", want, sizeof(want));
++	uint32_t rw = 0, test = 0;
++	PE_parse_boot_argn("emmcrw", &rw, sizeof(rw));
++	PE_parse_boot_argn("emmctest", &test, sizeof(test));
++
++	se.regs = ml_io_map(reg[0], reg[1]);
++	if (kmem_alloc_contig(kernel_map, &se.dma, DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("ONCLITE EMMC: no contiguous DMA memory\n");
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)se.dma);
++	if (!pn) {
++		return ENOMEM;
++	}
++	se.dma_pa = ptoa_64(pn);
++	if ((se.dma_pa + DMA_SIZE - 1) >> 32) {
++		printf("ONCLITE EMMC: DMA memory at 0x%llx is above 4 GiB (ADMA2 32-bit)\n", se.dma_pa);
++		return ENXIO;
++	}
++	se.secsize = DEV_BSIZE;
++
++	lck_mtx_lock(&onclite_emmc_lock);
++	error = emmc_take_over_host();
++	if (!error) {
++		error = emmc_read_ext_csd();
++	}
++	if (!error && test) {
++		emmc_selftest();
++		error = ECANCELED;
++	}
++	if (!error) {
++		error = emmc_gpt(want, false, &se.first_block, &se.nblocks);
++	}
++	lck_mtx_unlock(&onclite_emmc_lock);
++	if (error) {
++		return error;
++	}
++
++	se.bmajor = bdevsw_add(-1, &onclite_emmc_bdevsw);
++	if (se.bmajor < 0) {
++		return ENXIO;
++	}
++	se.cmajor = cdevsw_add_with_bdev(-1, &onclite_emmc_cdevsw, se.bmajor);
++	if (se.cmajor < 0) {
++		return ENXIO;
++	}
++	se.bdev = makedev(se.bmajor, 0);
++	devfs_make_node(se.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "emmcroot0");
++	devfs_make_node(makedev(se.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "remmcroot0");
++	/* Only now, with the partition bounds known, can writes be allowed. */
++	se.writable = (rw != 0);
++	se.ready = true;
++	printf("ONCLITE EMMC: \"%s\": first sector 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
++	    want, se.first_block, se.nblocks * EMMC_BLOCK >> 20,
++	    se.writable ? "read-write" : "read-only", se.dma_pa);
++	return 0;
++}
++
++int onclite_emmc_rootdev(dev_t *dev);
++
++int
++onclite_emmc_rootdev(dev_t *dev)
++{
++	if (!se.ready) {
++		int error = onclite_emmc_init();
++		if (error) {
++			return error;
++		}
++	}
++	*dev = se.bdev;
++	return 0;
++}
++#endif /* ONCLITE */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index e6c74aa..063250a 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -783,6 +783,23 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		goto iofrootx;
+ 	}
+ #endif
++#if defined(ARM64_BOARD_CONFIG_ONCLITE)
++//
++//	ONCLITE: root on a GPT partition of the internal eMMC (bsd/dev/onclite_emmc.c)
++//
++	if (strcmp(rdBootVar, "emmcroot0") == 0) {
++		extern int onclite_emmc_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int emmc_error = onclite_emmc_rootdev(root);
++		if (emmc_error) {
++			panic("IOFindBSDRoot: ONCLITE eMMC root %s unavailable: %d", rdBootVar, emmc_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
++#endif
+ 
+ //
+ //	Now check if we are trying to root on a memory device
