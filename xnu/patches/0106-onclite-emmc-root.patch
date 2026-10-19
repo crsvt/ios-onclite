@@ -12,10 +12,10 @@ index 6630131..c06142b 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/onclite_emmc.c b/bsd/dev/onclite_emmc.c
 new file mode 100644
-index 0000000..28f0843
+index 0000000..b0c9db6
 --- /dev/null
 +++ b/bsd/dev/onclite_emmc.c
-@@ -0,0 +1,928 @@
+@@ -0,0 +1,952 @@
 +/*
 + * onclite internal eMMC root device.
 + *
@@ -82,12 +82,14 @@ index 0000000..28f0843
 +#define SDHCI_RESPONSE          0x10
 +#define SDHCI_PRESENT_STATE     0x24
 +#define SDHCI_HOST_CONTROL      0x28    /* 8 bit */
++#define SDHCI_POWER_CONTROL     0x29    /* 8 bit */
 +#define SDHCI_CLOCK_CONTROL     0x2c    /* 16 bit */
 +#define SDHCI_TIMEOUT_CONTROL   0x2e    /* 8 bit */
 +#define SDHCI_SOFTWARE_RESET    0x2f    /* 8 bit */
 +#define SDHCI_INT_STATUS        0x30    /* normal [15:0], error [31:16] */
 +#define SDHCI_INT_ENABLE        0x34
 +#define SDHCI_SIGNAL_ENABLE     0x38
++#define SDHCI_HOST_CONTROL2     0x3e    /* 16 bit */
 +#define SDHCI_CAPABILITIES      0x40
 +#define SDHCI_ADMA_ADDRESS      0x58
 +#define SDHCI_ADMA_ADDRESS_HI   0x5c
@@ -105,8 +107,11 @@ index 0000000..28f0843
 +#define HCTL_DMA_MASK           (3u << 3)
 +#define HCTL_ADMA2_32           (2u << 3)
 +
++#define CLK_INT_EN              (1u << 0)
 +#define CLK_INT_STABLE          (1u << 1)
 +#define CLK_SD_EN               (1u << 2)
++
++#define PWR_BUS_ON              (1u << 0)
 +
 +#define RESET_CMD               (1u << 1)
 +#define RESET_DATA              (1u << 2)
@@ -494,13 +499,32 @@ index 0000000..28f0843
 +
 +	uint16_t version = rd16(SDHCI_HOST_VERSION), clk = rd16(SDHCI_CLOCK_CONTROL);
 +	uint32_t caps = rd32(SDHCI_CAPABILITIES), present = rd32(SDHCI_PRESENT_STATE);
-+	uint8_t hctl = rd8(SDHCI_HOST_CONTROL);
++	uint8_t hctl = rd8(SDHCI_HOST_CONTROL), power = rd8(SDHCI_POWER_CONTROL);
++	uint16_t hctl2 = rd16(SDHCI_HOST_CONTROL2);
 +
-+	printf("ONCLITE EMMC: SDHCI version 0x%x caps 0x%x present 0x%x host 0x%x clock 0x%x\n",
-+	    version, caps, present, hctl, clk);
-+	if (!(clk & CLK_INT_STABLE) || !(clk & CLK_SD_EN)) {
-+		printf("ONCLITE EMMC: bootloader left the card clock off\n");
++	printf("ONCLITE EMMC: SDHCI version 0x%x caps 0x%x present 0x%x host 0x%x power 0x%x "
++	    "host2 0x%x clock 0x%x\n", version, caps, present, hctl, power, hctl2, clk);
++	if (!(power & PWR_BUS_ON)) {
++		/* Powering the bus needs sdhci-msm's PWRCTL handshake: not done here. */
++		printf("ONCLITE EMMC: bus power is off\n");
 +		return ENXIO;
++	}
++	if (!(clk & CLK_INT_EN) || !(clk & CLK_INT_STABLE)) {
++		printf("ONCLITE EMMC: internal clock not running\n");
++		return ENXIO;
++	}
++	if (!(clk & CLK_SD_EN)) {
++		/*
++		 * The divider is LK's (0 on sdhci-msm: the GCC sdcc1_apps rate LK chose
++		 * passes through); only the card clock gate is closed.
++		 */
++		wr16(SDHCI_CLOCK_CONTROL, (uint16_t)(clk | CLK_SD_EN));
++		delay(1000);
++		clk = rd16(SDHCI_CLOCK_CONTROL);
++		printf("ONCLITE EMMC: card clock enabled (clock 0x%x)\n", clk);
++		if (!(clk & CLK_SD_EN)) {
++			return EIO;
++		}
 +	}
 +	if (!(caps & CAP_ADMA2)) {
 +		printf("ONCLITE EMMC: host has no ADMA2\n");

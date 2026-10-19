@@ -139,6 +139,9 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   LK runs mmc_put_card_to_sleep (CMD7 deselect, CMD5 sleep, RCA = MMC_RCA = 2) and sdhci_mode_disable (core_mem
   0x7824000 + 0x78 HC_MODE bit 0 cleared -> legacy MCI). Driver now sets HC_MODE_EN|FF_CLK_SW_RST_DIS (no reset; LK's
   clock/8-bit/timing stay) and wakes the card (CMD13 probe, CMD5 awake, CMD7 select); ADT reg adds core_mem.
+- **eMMC test C2 (18:17 UTC, CI 39299535216):** `HC_MODE 0x0` confirmed; with SDHCI mode back on the clock reads
+  0x3 (internal clock on, card clock gate off; C1's 0x7 was the stale MCI-mode view). Driver now logs power/host2 and
+  sets SD_CLK_EN (divider stays 0 = GCC rate from LK) when bus power is on. Auto-reset returned in 61 s.
 - Reference (user, 2026-10-19): https://github.com/dipa-studio/ios-extra = sweet's driver playground (Adreno 618
   GPU bring-up: GMU, power, SMMU; docs/GPU_API_RE.md on how this iOS image loads Metal device plugins). onclite has
   an Adreno 506 (different generation); only the iOS-side GPU/Metal research carries over, later.
