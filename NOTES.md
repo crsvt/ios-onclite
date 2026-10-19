@@ -176,6 +176,14 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   0x85a = 0x08 (DVDD hard reset), 0x85b = 0x80. `adb reboot recovery` -> TWRP 3.7.1 in 35 s: Linux switches the
   PS_HOLD reset to warm first (qpnp_pon_reset_config). 0105 now does the same: 0x85b=0, 500 us, 0x85a=(x&~0xf)|1,
   0x85b=0x80, then SOFT_RB_SPARE (read back logged), then PS_HOLD.
+- **C8 PASSED (19:53 UTC, CI 39312909533, `logs/xnu-c8-resettest.txt`):** restart log `reset ctl 0x1, SOFT_RB_SPARE
+  0x0 -> 0x4 (spmi 0)` and the phone came up in TWRP 3.7.1 after 76 s. Every test cycle now ends in TWRP (pstore
+  readable there via adb as root); Lineage never boots.
+- **FLASH (user-approved 2026-10-19, "flash once C8 passes"):** platform-tools 37 `fastboot -S 512M flash` of the raw
+  16 GiB image failed at once ("Failed reading from userdata", nothing sent). New `tools/img2simg.py` (RAW chunks
+  <= 64 MiB, zero blocks as FILL 0, never DONT_CARE) -> `research/ios-root/ios16-root.simg` 12,149,343,860 bytes,
+  27333 chunks; decoded SHA-256 == raw 6995911b...c073d. Flashed with `fastboot flash userdata ios16-root.simg`
+  (log `logs/flash-userdata.txt`). From here userdata is the iOS root: NEVER boot Lineage (hold Volume up/down).
 - Root image on the Mac: `research/ios-root/ios16-root.img` (SHA256 6995911b...c073d verified after rsync);
   deleted on the server (its ~/ios-onclite-root keeps tools/src/log only).
 - **iOS ROOT IMAGE BUILT on the server (2026-10-19 18:44-18:50 UTC):** `~/ios-onclite-root/build-root.sh` (copy in the
