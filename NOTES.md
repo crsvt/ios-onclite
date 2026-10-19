@@ -209,6 +209,24 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   480 s timer restarted to TWRP (warm PS_HOLD path works). CPU rendering works without IOAcceleratorES, as on
   sweet. No sampler output lines were seen in the log. Lesson: Power + Volume up is a cold reset and loses the
   ramoops log (a first E2 30-min run was lost that way); only Power + Volume down ~15 s keeps RAM.
+- **E3/E3b (onclite_reboot_after=1800):** both logs end at exactly the same line, right after `SWEET FB: AppleCLCD ...`
+  (8745 bytes each), screen black. Runs with 480/600 s got past it. Guess (not proven): one IOSleep(1800000 ms)
+  breaks something (ns * 19.2 MHz > 2^64 above ~960 s). Fix committed (timer sleeps 60 s at a time, CI 39331338643).
+- **E4 (900 s), manual Power+VolDown at ~11 min:** user saw the Apple logo, but the log stops at line 331 (launchd mapping
+  the shared cache), no swaps. So a manual reset can also lose the end of the log; the kernel's own PS_HOLD restart
+  always gave complete logs (E1, E2, E5). Unexplained.
+- **Get to TWRP from fastboot without buttons:** `fastboot reboot recovery` works on this LK (`fastboot oem
+  reboot-recovery` does not exist; `fastboot boot backup/recovery.img` returned OKAY but stayed in fastboot).
+- **E5 (600 s timer, 03:14 IST, `logs/xnu-e5-display.txt`, complete):** 5 swaps (Apple logo), boot still starting
+  daemons at 10 min (tccd, findmydeviced, bluetoothd, datamigrator, ...), identityservicesd burning CPU (75 %), no
+  crash except driverkitd sig 9. The sampler printed NOTHING (no `SMP --- sample 0`, which should come 90 s after the
+  root): its tsleep(90*hz) never returns? Not investigated yet.
+- **E6 (no timer, 03:26 IST):** running so the user can watch for the home screen.
+- **0108 touch (`bsd/dev/onclite_touch.c`, CI 39332051381):** FT5446 @0x38 on BLSP1 QUP3 0x78b7000, polled FIFO
+  transfers with V2 tags, GCC BLSP1 AHB vote + QUP3 RCG XO/1 + CBCR, GPIO10/11 func 2, reset GPIO64, chip ID
+  0xA3/0x9F, report reg 0x00 every 10 ms, panel 720x1520 -> canvas -> sweet 1080x2400 coordinates for
+  sweet_hid_touch. Starts 45 s after the root (onclitetouchdelay). Unverified: L10 touch power after LK, FIFO size.
+  Research: `.claude/research/touch-report.md`. Export script has a 0108 step now.
 - Root image on the Mac: `research/ios-root/ios16-root.img` (SHA256 6995911b...c073d verified after rsync);
   deleted on the server (its ~/ios-onclite-root keeps tools/src/log only).
 - **iOS ROOT IMAGE BUILT on the server (2026-10-19 18:44-18:50 UTC):** `~/ios-onclite-root/build-root.sh` (copy in the
