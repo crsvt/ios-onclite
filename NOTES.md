@@ -127,6 +127,12 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   (every 5 s) until the manual reset, no panic. SMP on the whole Gold cluster, exec, code signature, syscalls, devfs
   console all work on hardware. Next: eMMC (SDHCI) driver for the userdata root; reset via PS_HOLD.
 - TWO PHONES may be on USB (a Mi A2 `jasmine_sprout` too): always `export ANDROID_SERIAL=$(cat .claude/device/adb-serial)` (Redmi 7 serial, kept out of git) for adb/fastboot.
+- **eMMC test C1 (17:58 UTC, CI 39297041914):** auto-reboot via PS_HOLD works (panic -> back in Lineage after 65 s,
+  `logs/xnu-c-emmctest-1.txt`). eMMC: `SDHCI version 0x4d02 caps 0x342dc8b2 present 0x1f80000 host 0x30 clock 0x7`,
+  then CMD8 never completed (int status 0, CMD inhibit stuck). Cause (lk2nd target/msm8953/init.c target_uninit):
+  LK runs mmc_put_card_to_sleep (CMD7 deselect, CMD5 sleep, RCA = MMC_RCA = 2) and sdhci_mode_disable (core_mem
+  0x7824000 + 0x78 HC_MODE bit 0 cleared -> legacy MCI). Driver now sets HC_MODE_EN|FF_CLK_SW_RST_DIS (no reset; LK's
+  clock/8-bit/timing stay) and wakes the card (CMD13 probe, CMD5 awake, CMD7 select); ADT reg adds core_mem.
 - Reference (user, 2026-10-19): https://github.com/dipa-studio/ios-extra = sweet's driver playground (Adreno 618
   GPU bring-up: GMU, power, SMMU; docs/GPU_API_RE.md on how this iOS image loads Metal device plugins). onclite has
   an Adreno 506 (different generation); only the iOS-side GPU/Metal research carries over, later.

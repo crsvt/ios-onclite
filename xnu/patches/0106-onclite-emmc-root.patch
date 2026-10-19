@@ -12,17 +12,23 @@ index 6630131..c06142b 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/onclite_emmc.c b/bsd/dev/onclite_emmc.c
 new file mode 100644
-index 0000000..d1373bc
+index 0000000..28f0843
 --- /dev/null
 +++ b/bsd/dev/onclite_emmc.c
-@@ -0,0 +1,846 @@
+@@ -0,0 +1,928 @@
 +/*
 + * onclite internal eMMC root device.
 + *
 + * The Redmi 7 boots from eMMC behind a Qualcomm SDHCI host (sdhci-msm,
 + * "hc_mem" at 0x7824900). LK loaded our boot image through it and leaves the
 + * controller powered and clocked with the card selected in transfer state.
-+ * This driver reuses that state like sweet_ufs.c does for UFS: it switches
++ * Before starting a kernel LK's target_uninit() deselects the card and puts
++ * it to sleep (CMD7 0, CMD5 sleep, RCA 2) and clears HC_MODE_EN in the
++ * vendor "core_mem" HC_MODE register, which hands the host back to the
++ * legacy MCI interface: SDHCI commands then never complete. So this driver
++ * first sets HC_MODE_EN again (no controller reset) and wakes and selects the
++ * card (CMD5 awake, CMD7). Otherwise it reuses LK's state like sweet_ufs.c
++ * does for UFS: it switches
 + * the host to ADMA2 (32-bit; all kernel RAM is below 4 GiB), keeps LK's bus
 + * width, timing and clock, and issues polled CMD17/18 and CMD24/25 (auto
 + * CMD12) to the user data area. It finds one GPT partition by name (boot-arg
@@ -87,6 +93,11 @@ index 0000000..d1373bc
 +#define SDHCI_ADMA_ADDRESS_HI   0x5c
 +#define SDHCI_HOST_VERSION      0xfe    /* 16 bit */
 +
++/* Qualcomm vendor registers ("core_mem", MCI present: qcom,sdhci-msm) */
++#define SDCC_HC_MODE            0x78
++#define HC_MODE_EN              (1u << 0)
++#define FF_CLK_SW_RST_DIS       (1u << 13)
++
 +#define PRES_CMD_INHIBIT        (1u << 0)
 +#define PRES_DATA_INHIBIT       (1u << 1)
 +#define PRES_DAT0               (1u << 20)
@@ -124,7 +135,14 @@ index 0000000..d1373bc
 +#define CMD_R1                  (CMD_RESP_48 | CMD_CRC | CMD_INDEX)
 +#define CMD_R1B                 (CMD_RESP_48_BUSY | CMD_CRC | CMD_INDEX)
 +
++#define MMC_SLEEP_AWAKE         5
++#define MMC_SELECT_CARD         7
++#define MMC_SEND_STATUS         13
 +#define MMC_SWITCH              6
++#define LK_EMMC_RCA             2       /* lk platform/msm_shared MMC_RCA */
++#define R1_STATE(r1)            (((r1) >> 9) & 0xf)
++#define R1_STATE_STBY           3
++#define R1_STATE_TRAN           4
 +#define MMC_SEND_EXT_CSD        8
 +#define MMC_READ_SINGLE         17
 +#define MMC_READ_MULTIPLE       18
@@ -171,6 +189,8 @@ index 0000000..d1373bc
 +
 +static struct {
 +	vm_offset_t regs;
++	vm_offset_t core;                       /* vendor registers */
++	uint32_t rca;
 +	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
 +	uint64_t dma_pa;
 +	uint64_t card_sectors;                  /* whole user area, 512-byte sectors */
@@ -411,9 +431,67 @@ index 0000000..d1373bc
 +	return se.cache_on ? emmc_switch(EXT_CSD_FLUSH_CACHE, 1) : 0;
 +}
 +
++/* Undo LK's target_uninit(): SDHCI mode back on, keeping its clock and bus setup. */
++static int
++emmc_enable_hc_mode(void)
++{
++	uint32_t mode = *(volatile uint32_t *)(se.core + SDCC_HC_MODE);
++	printf("ONCLITE EMMC: HC_MODE 0x%x (SDHCI mode %s)\n", mode, (mode & HC_MODE_EN) ? "on" : "off");
++	if ((mode & (HC_MODE_EN | FF_CLK_SW_RST_DIS)) != (HC_MODE_EN | FF_CLK_SW_RST_DIS)) {
++		*(volatile uint32_t *)(se.core + SDCC_HC_MODE) = mode | HC_MODE_EN | FF_CLK_SW_RST_DIS;
++		__builtin_arm_dsb(0xf);
++		mode = *(volatile uint32_t *)(se.core + SDCC_HC_MODE);
++		if (!(mode & HC_MODE_EN)) {
++			printf("ONCLITE EMMC: HC_MODE_EN did not stick (0x%x)\n", mode);
++			return EIO;
++		}
++	}
++	return 0;
++}
++
++/*
++ * Bring the card from LK's sleep (or standby) to the transfer state. A
++ * sleeping card answers only CMD0 and CMD5, so CMD13 times out there.
++ */
++static int
++emmc_wake_card(void)
++{
++	uint32_t r1 = 0, arg = se.rca << 16;
++	int error = emmc_cmd(MMC_SEND_STATUS, arg, CMD_R1, 0, false, &r1);
++	if (!error && R1_STATE(r1) == R1_STATE_TRAN) {
++		printf("ONCLITE EMMC: card RCA %u already in transfer state (0x%x)\n", se.rca, r1);
++		return 0;
++	}
++	if (error) {
++		printf("ONCLITE EMMC: no status from RCA %u: assuming sleep, sending CMD5 awake\n", se.rca);
++		error = emmc_cmd(MMC_SLEEP_AWAKE, arg, CMD_R1B, 0, false, &r1);
++		if (error) {
++			return error;
++		}
++	} else if (R1_STATE(r1) != R1_STATE_STBY) {
++		printf("ONCLITE EMMC: card RCA %u in unexpected state %u (0x%x)\n", se.rca, R1_STATE(r1), r1);
++		return EIO;
++	}
++	error = emmc_cmd(MMC_SELECT_CARD, arg, CMD_R1B, 0, false, &r1);
++	if (error) {
++		return error;
++	}
++	error = emmc_cmd(MMC_SEND_STATUS, arg, CMD_R1, 0, false, &r1);
++	if (error) {
++		return error;
++	}
++	printf("ONCLITE EMMC: card RCA %u selected, state %u (0x%x)\n", se.rca, R1_STATE(r1), r1);
++	return R1_STATE(r1) == R1_STATE_TRAN ? 0 : EIO;
++}
++
 +static int
 +emmc_take_over_host(void)
 +{
++	int error = emmc_enable_hc_mode();
++	if (error) {
++		return error;
++	}
++
 +	uint16_t version = rd16(SDHCI_HOST_VERSION), clk = rd16(SDHCI_CLOCK_CONTROL);
 +	uint32_t caps = rd32(SDHCI_CAPABILITIES), present = rd32(SDHCI_PRESENT_STATE);
 +	uint8_t hctl = rd8(SDHCI_HOST_CONTROL);
@@ -441,7 +519,7 @@ index 0000000..d1373bc
 +		printf("ONCLITE EMMC: host did not take ADMA2\n");
 +		return EIO;
 +	}
-+	return 0;
++	return emmc_wake_card();
 +}
 +
 +static int
@@ -782,9 +860,10 @@ index 0000000..d1373bc
 +	char want[64] = "userdata";
 +	int error;
 +
++	/* reg = <hc_mem size core_mem size> */
 +	if (SecureDTLookupEntry(NULL, "/onclite-emmc", &node) != kSuccess ||
 +	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
-+	    size < 2 * sizeof(uintptr_t)) {
++	    size < 4 * sizeof(uintptr_t)) {
 +		printf("ONCLITE EMMC: no /onclite-emmc node in the device tree\n");
 +		return ENXIO;
 +	}
@@ -792,8 +871,11 @@ index 0000000..d1373bc
 +	uint32_t rw = 0, test = 0;
 +	PE_parse_boot_argn("emmcrw", &rw, sizeof(rw));
 +	PE_parse_boot_argn("emmctest", &test, sizeof(test));
++	se.rca = LK_EMMC_RCA;
++	PE_parse_boot_argn("emmcrca", &se.rca, sizeof(se.rca));
 +
 +	se.regs = ml_io_map(reg[0], reg[1]);
++	se.core = ml_io_map(reg[2], reg[3]);
 +	if (kmem_alloc_contig(kernel_map, &se.dma, DMA_SIZE, PAGE_MASK, 0, 0,
 +	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 +		printf("ONCLITE EMMC: no contiguous DMA memory\n");

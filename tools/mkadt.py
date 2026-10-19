@@ -263,10 +263,10 @@ def build(seed=None, qemu=False, highmem=False, onclite=False):
         # zone is fixed in the kernel, the node only enables it. No fbcon (LK
         # switches the panel off for fastboot boot), no UFS (eMMC phone).
         ramoops = node('sweet-ramoops', [ph(), ('reg', u64(0x91400000, 0x200000))])
-        # bsd/dev/onclite_emmc.c: the SDHCI host LK leaves running (sdhci@7824900
-        # "hc_mem"; absolute physical reg like /sweet-ufs).
+        # bsd/dev/onclite_emmc.c: the eMMC SDHCI host (sdhci@7824900 "hc_mem",
+        # then the vendor "core_mem"; absolute physical reg like /sweet-ufs).
         emmc = node('onclite-emmc', [ph(), ('compatible', cstr('qcom,sdhci-msm')),
-                                     ('reg', u64(0x07824900, 0x500))])
+                                     ('reg', u64(0x07824900, 0x500, 0x07824000, 0x800))])
         return node('device-tree', [
             ph(),
             ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,onclite') + cstr('qcom,sdm632') + cstr('AppleARM')),
