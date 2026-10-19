@@ -128,7 +128,10 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   console all work on hardware. Next: eMMC (SDHCI) driver for the userdata root; reset via PS_HOLD.
 - PUSH ONLY with `.claude/scripts/safe-push.sh` (refuses added lines containing identifiers from
   `.claude/device/identifiers.txt`). An earlier push leaked the Redmi 7 adb serial in NOTES.md history (commit
-  ae7de0f..); removed from the file since d2b3c2a; history rewrite of onclite-ci awaits the user's decision.
+  ae7de0f..); 2026-10-19 the user approved a rewrite: all onclite commits after fdad0de were
+  filtered (serial -> placeholder) and onclite-ci force-pushed (2898a56 -> 63d92c6); 0 identifiers reachable from it.
+  Local backup branch `backup/pre-serial-scrub` (old history, never push it). Old SHAs may stay fetchable on GitHub.
+  CI has cancel-in-progress per branch: a new push cancels the running build.
 - TWO PHONES may be on USB (a Mi A2 `jasmine_sprout` too): always `export ANDROID_SERIAL=$(cat .claude/device/adb-serial)` (Redmi 7 serial, kept out of git) for adb/fastboot.
 - **eMMC test C1 (17:58 UTC, CI 39297041914):** auto-reboot via PS_HOLD works (panic -> back in Lineage after 65 s,
   `logs/xnu-c-emmctest-1.txt`). eMMC: `SDHCI version 0x4d02 caps 0x342dc8b2 present 0x1f80000 host 0x30 clock 0x7`,
