@@ -1,0 +1,494 @@
+diff --git a/bsd/dev/onclite_touch.c b/bsd/dev/onclite_touch.c
+new file mode 100644
+index 0000000..ee815f4
+--- /dev/null
++++ b/bsd/dev/onclite_touch.c
+@@ -0,0 +1,488 @@
++/*
++ * onclite touch: FocalTech FT5446 (I2C 0x38) on BLSP1 QUP3 (0x78b7000).
++ *
++ * Linux (Lineage 4.19, focaltech_touch + i2c-msm-v2) is the reference; see
++ * .claude/research/touch-report.md for the register sources. LK leaves the
++ * QUP unclocked, so this driver enables the BLSP1 AHB vote and the QUP3 I2C
++ * core clock at XO (19.2 MHz), muxes GPIO10/11 to blsp_i2c3, pulses the
++ * touch reset (GPIO64), checks the chip ID (0xA3 = 0x54, 0x9F = 0x22) and
++ * then polls the touch report (register 0x00) every 10 ms with polled QUP
++ * FIFO transfers (V2 tags). Touch power (PM8953 L10, L6) is assumed to be
++ * on after LK: a NACK on every probe means it is not.
++ *
++ * The IC reports 720x1520 panel pixels. AppleCLCD shows its 1125x2436
++ * canvas scaled into 701x1520 at x = 9 (SweetFramebuffer.cpp), and
++ * sweet_hid_touch() takes sweet's 1080x2400 panel pixels centered in that
++ * canvas, so points are mapped panel -> canvas -> sweet panel.
++ *
++ * Boot-args: onclitetouch=0 disables it, onclitetouchdelay=N (seconds,
++ * default 45) delays the first bus access.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ONCLITE)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++/* Mach MIG declaration is not included by BSD's exported thread.h. */
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void onclite_touch_init(void);
++
++#define TOUCH_GCC_PA            0x01800000u
++#define TOUCH_GCC_SIZE          0x46000u
++#define GCC_BLSP1_AHB_CBCR      0x01008u
++#define GCC_QUP3_I2C_CMD_RCGR   0x04000u
++#define GCC_QUP3_I2C_CFG_RCGR   0x04004u
++#define GCC_QUP3_I2C_CBCR       0x04020u
++#define GCC_BRANCH_ENA_VOTE     0x45004u
++#define GCC_VOTE_BLSP1_AHB      (1u << 10)
++#define CBCR_CLK_OFF            (1u << 31)
++
++#define TOUCH_TLMM_PA           0x01000000u
++#define TOUCH_TLMM_SIZE         0x42000u
++#define TLMM_CFG(n)             ((uint32_t)(n) * 0x1000u)
++#define TLMM_IO(n)              (TLMM_CFG(n) + 4u)
++#define GPIO_SDA                10u
++#define GPIO_SCL                11u
++#define GPIO_RESET              64u
++#define GPIO_INT                65u
++
++#define TOUCH_QUP_PA            0x078b7000u
++#define TOUCH_QUP_SIZE          0x1000u
++#define QUP_CONFIG              0x000u
++#define QUP_STATE               0x004u
++#define QUP_IO_MODES            0x008u
++#define QUP_SW_RESET            0x00cu
++#define QUP_OPERATIONAL         0x018u
++#define QUP_ERROR_FLAGS         0x01cu
++#define QUP_ERROR_FLAGS_EN      0x020u
++#define QUP_OPERATIONAL_MASK    0x028u
++#define QUP_HW_VERSION          0x030u
++#define QUP_MX_OUTPUT_COUNT     0x100u
++#define QUP_MX_WRITE_COUNT      0x150u
++#define QUP_OUT_FIFO            0x110u
++#define QUP_MX_INPUT_COUNT      0x200u
++#define QUP_MX_READ_COUNT       0x208u
++#define QUP_IN_FIFO             0x218u
++#define QUP_I2C_CLK_CTL         0x400u
++#define QUP_I2C_STATUS          0x404u
++#define QUP_I2C_MASTER_CONFIG   0x408u
++
++#define QUP_CONFIG_I2C          0x207u          /* mini core I2C, 8-bit words */
++#define QUP_STATE_RESET         0u
++#define QUP_STATE_RUN           1u
++#define QUP_STATE_PAUSE         3u
++#define QUP_STATE_MASK          3u
++#define QUP_STATE_VALID         (1u << 2)
++#define QUP_I2C_MAST_GEN        (1u << 4)
++#define QUP_OP_SERVICE          (3u << 8)
++#define QUP_OP_MAX_INPUT_DONE   (1u << 11)
++#define QUP_OP_MAX_OUTPUT_DONE  (1u << 10)
++#define QUP_ERRORS              0x3cu
++#define QUP_I2C_ERRORS          0x0380003cu
++#define QUP_I2C_NACK            (1u << 3)
++#define QUP_CLK_400K            0x000e001cu     /* 19.2 MHz: fs 28, ht 14 */
++
++#define TAG_START               0x81u
++#define TAG_WRITE               0x82u
++#define TAG_READ_N_STOP         0x87u
++
++#define FTS_ADDR                0x38u
++#define FTS_POINTS              10u
++#define FTS_PANEL_W             720
++#define FTS_PANEL_H             1520
++/* SweetFramebuffer.cpp (ONCLITE): canvas 1125x2436 shown as 701x1520 at x = 9 */
++#define CANVAS_W                1125
++#define CANVAS_H                2436
++#define CANVAS_OUT_X            9
++#define CANVAS_OUT_W            701
++/* SweetHID.cpp: sweet's 1080x2400 panel centered in the canvas */
++#define SWEET_OFF_X             ((CANVAS_W - 1080) / 2)
++#define SWEET_OFF_Y             ((CANVAS_H - 2400) / 2)
++
++static struct {
++	vm_offset_t gcc, tlmm, qup;
++	bool started;
++	unsigned in_fifo, out_fifo;     /* bytes */
++	unsigned report_len;            /* bytes read from register 0x00 */
++	uint32_t i2c_status, op;        /* last failed transfer */
++	uint32_t active;
++	int x[FTS_POINTS], y[FTS_POINTS];
++} ot;
++static int touch_sleep_chan;
++
++static uint32_t
++rd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr32(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++touch_wait(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&touch_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(rd32(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++touch_clocks(void)
++{
++	wr32(ot.gcc, GCC_BRANCH_ENA_VOTE, rd32(ot.gcc, GCC_BRANCH_ENA_VOTE) | GCC_VOTE_BLSP1_AHB);
++	if (!wait_clear(ot.gcc, GCC_BLSP1_AHB_CBCR, CBCR_CLK_OFF)) {
++		printf("ONCLITE TOUCH: BLSP1 AHB clock stays off (%#x)\n", rd32(ot.gcc, GCC_BLSP1_AHB_CBCR));
++		return false;
++	}
++	/* XO source, divider 1: 19.2 MHz, no PLL. */
++	wr32(ot.gcc, GCC_QUP3_I2C_CFG_RCGR, 1u);
++	wr32(ot.gcc, GCC_QUP3_I2C_CMD_RCGR, rd32(ot.gcc, GCC_QUP3_I2C_CMD_RCGR) | 1u);
++	if (!wait_clear(ot.gcc, GCC_QUP3_I2C_CMD_RCGR, 1u)) {
++		printf("ONCLITE TOUCH: QUP3 RCG update timeout (%#x)\n", rd32(ot.gcc, GCC_QUP3_I2C_CMD_RCGR));
++		return false;
++	}
++	wr32(ot.gcc, GCC_QUP3_I2C_CBCR, rd32(ot.gcc, GCC_QUP3_I2C_CBCR) | 1u);
++	if (!wait_clear(ot.gcc, GCC_QUP3_I2C_CBCR, CBCR_CLK_OFF)) {
++		printf("ONCLITE TOUCH: QUP3 I2C clock stays off (%#x)\n", rd32(ot.gcc, GCC_QUP3_I2C_CBCR));
++		return false;
++	}
++	return true;
++}
++
++static void
++touch_gpio(unsigned pin, unsigned func, unsigned pull, unsigned ma, bool out, bool high)
++{
++	if (out) {
++		/* Latch the level before enabling the output (reset is active low). */
++		wr32(ot.tlmm, TLMM_IO(pin), (rd32(ot.tlmm, TLMM_IO(pin)) & ~2u) | (high ? 2u : 0u));
++	}
++	uint32_t cfg = rd32(ot.tlmm, TLMM_CFG(pin)) & ~0x3ffu;
++	cfg |= pull | (func << 2) | ((ma / 2u - 1u) << 6) | (out ? 0x200u : 0u);
++	wr32(ot.tlmm, TLMM_CFG(pin), cfg);
++}
++
++static bool
++qup_state(uint32_t state)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		uint32_t s = rd32(ot.qup, QUP_STATE);
++		if ((s & QUP_STATE_VALID) && (s & QUP_STATE_MASK) == state) {
++			return true;
++		}
++		if (s & QUP_STATE_VALID) {
++			wr32(ot.qup, QUP_STATE, state);
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static unsigned
++qup_fifo_bytes(uint32_t blk, uint32_t size)
++{
++	static const unsigned blk_bytes[4] = {16, 16, 32, 0};
++	static const unsigned blocks[8] = {2, 4, 8, 16, 0, 0, 0, 0};
++	return blk_bytes[blk & 3u] * blocks[size & 7u];
++}
++
++static bool
++qup_init(void)
++{
++	wr32(ot.qup, QUP_SW_RESET, 1);
++	delay(100);
++	if (!qup_state(QUP_STATE_RESET)) {
++		printf("ONCLITE TOUCH: QUP does not leave reset (state %#x)\n", rd32(ot.qup, QUP_STATE));
++		return false;
++	}
++	wr32(ot.qup, QUP_CONFIG, QUP_CONFIG_I2C);
++	wr32(ot.qup, QUP_ERROR_FLAGS_EN, QUP_ERRORS);
++	wr32(ot.qup, QUP_OPERATIONAL_MASK, QUP_OP_SERVICE);
++	wr32(ot.qup, QUP_I2C_MASTER_CONFIG, 1);   /* V2 tags */
++	uint32_t io = rd32(ot.qup, QUP_IO_MODES);
++	ot.out_fifo = qup_fifo_bytes(io, io >> 2);
++	ot.in_fifo = qup_fifo_bytes(io >> 5, io >> 7);
++	printf("ONCLITE TOUCH: QUP version %#x state %#x io_modes %#x: out FIFO %u, in FIFO %u bytes\n",
++	    rd32(ot.qup, QUP_HW_VERSION), rd32(ot.qup, QUP_STATE), io, ot.out_fifo, ot.in_fifo);
++	if (!(rd32(ot.qup, QUP_STATE) & QUP_I2C_MAST_GEN) || ot.out_fifo < 16 || ot.in_fifo < 16) {
++		printf("ONCLITE TOUCH: QUP is not an I2C master with usable FIFOs\n");
++		return false;
++	}
++	return true;
++}
++
++/* Write reg, repeated START, read len bytes; one FIFO-mode transfer. */
++static int
++qup_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned len)
++{
++	if (len == 0 || len + 2u > ot.in_fifo || len > 255) {
++		return EINVAL;
++	}
++	if (!qup_state(QUP_STATE_RESET)) {
++		return EBUSY;
++	}
++	wr32(ot.qup, QUP_MX_OUTPUT_COUNT, 0);
++	wr32(ot.qup, QUP_MX_INPUT_COUNT, 0);
++	wr32(ot.qup, QUP_MX_WRITE_COUNT, 9);
++	wr32(ot.qup, QUP_MX_READ_COUNT, len + 2u);
++	wr32(ot.qup, QUP_CONFIG, QUP_CONFIG_I2C);
++	wr32(ot.qup, QUP_IO_MODES, (rd32(ot.qup, QUP_IO_MODES) & ~0x1fc00u) | 0xc000u);
++	wr32(ot.qup, QUP_OPERATIONAL_MASK, QUP_OP_SERVICE);
++	if (!qup_state(QUP_STATE_RUN)) {
++		return EBUSY;
++	}
++	wr32(ot.qup, QUP_I2C_CLK_CTL, QUP_CLK_400K);
++	if (!qup_state(QUP_STATE_PAUSE)) {
++		return EBUSY;
++	}
++	/* START addr+W, WRITE 1: reg; START addr+R, READ_N_STOP len */
++	const uint8_t out[9] = {
++		TAG_START, (uint8_t)(addr << 1), TAG_WRITE, 1, reg,
++		TAG_START, (uint8_t)((addr << 1) | 1u), TAG_READ_N_STOP, (uint8_t)len,
++	};
++	for (unsigned i = 0; i < sizeof(out); i += 4) {
++		uint32_t word = 0;
++		for (unsigned j = 0; j < 4 && i + j < sizeof(out); ++j) {
++			word |= (uint32_t)out[i + j] << (8u * j);
++		}
++		wr32(ot.qup, QUP_OUT_FIFO, word);
++	}
++	if (!qup_state(QUP_STATE_RUN)) {
++		return EBUSY;
++	}
++	int err = ETIMEDOUT;
++	for (unsigned i = 0; i < 10000; ++i) {
++		uint32_t st = rd32(ot.qup, QUP_I2C_STATUS);
++		uint32_t ef = rd32(ot.qup, QUP_ERROR_FLAGS);
++		uint32_t op = rd32(ot.qup, QUP_OPERATIONAL);
++		if ((st & QUP_I2C_ERRORS) || (ef & QUP_ERRORS)) {
++			ot.i2c_status = st;
++			ot.op = op;
++			err = (st & QUP_I2C_NACK) ? ENXIO : EIO;
++			wr32(ot.qup, QUP_I2C_STATUS, st & QUP_I2C_ERRORS);
++			wr32(ot.qup, QUP_ERROR_FLAGS, ef & QUP_ERRORS);
++			break;
++		}
++		if (op & QUP_OP_MAX_INPUT_DONE) {
++			unsigned got = 0, total = len + 2u;
++			while (got < total) {
++				uint32_t word = rd32(ot.qup, QUP_IN_FIFO);
++				for (unsigned j = 0; j < 4 && got < total; ++j, ++got) {
++					if (got >= 2) {         /* 2 input tag bytes first */
++						buf[got - 2] = (uint8_t)(word >> (8u * j));
++					}
++				}
++			}
++			wr32(ot.qup, QUP_OPERATIONAL, QUP_OP_SERVICE);
++			err = 0;
++			break;
++		}
++		delay(1);
++	}
++	if (err == ETIMEDOUT) {
++		ot.i2c_status = rd32(ot.qup, QUP_I2C_STATUS);
++		ot.op = rd32(ot.qup, QUP_OPERATIONAL);
++	}
++	(void)qup_state(QUP_STATE_RESET);
++	return err;
++}
++
++static void
++touch_map(int px, int py, int *sx, int *sy)
++{
++	int cx = (px - CANVAS_OUT_X) * CANVAS_W / CANVAS_OUT_W;
++	int cy = py * CANVAS_H / FTS_PANEL_H;
++	*sx = cx - SWEET_OFF_X;
++	*sy = cy - SWEET_OFF_Y;
++}
++
++static void
++touch_report(uint32_t mask, const int *x, const int *y)
++{
++	for (unsigned id = 0; id < FTS_POINTS; ++id) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			if (!(ot.active & bit) || x[id] != ot.x[id] || y[id] != ot.y[id]) {
++				int sx, sy;
++				touch_map(x[id], y[id], &sx, &sy);
++				sweet_hid_touch((int)id, 1, sx, sy);
++			}
++			ot.x[id] = x[id];
++			ot.y[id] = y[id];
++		} else if (ot.active & bit) {
++			int sx, sy;
++			touch_map(ot.x[id], ot.y[id], &sx, &sy);
++			sweet_hid_touch((int)id, 0, sx, sy);
++		}
++	}
++	ot.active = mask;
++}
++
++static int
++touch_poll(void)
++{
++	uint8_t buf[3 + 6 * FTS_POINTS];
++	int x[FTS_POINTS] = {0}, y[FTS_POINTS] = {0};
++	uint32_t mask = 0, seen = 0;
++	int err = qup_read(FTS_ADDR, 0x00, buf, ot.report_len);
++	if (err) {
++		return err;
++	}
++	unsigned n = buf[2] & 15u;
++	unsigned slots = (ot.report_len - 3u) / 6u;
++	if ((buf[0] & 0x70u) || n > FTS_POINTS) {
++		return EIO;
++	}
++	for (unsigned i = 0; i < slots; ++i) {
++		const uint8_t *p = buf + 3u + 6u * i;
++		unsigned id = p[2] >> 4, event = p[0] >> 6;
++		if (id >= FTS_POINTS) {
++			break;          /* 0xF: empty slot, no more records */
++		}
++		if (seen & (1u << id)) {
++			return EIO;
++		}
++		seen |= 1u << id;
++		if (event == 1u || event == 3u) {
++			continue;       /* up / no event */
++		}
++		int px = ((p[0] & 15) << 8) | p[1];
++		int py = ((p[2] & 15) << 8) | p[3];
++		if (px >= FTS_PANEL_W || py >= FTS_PANEL_H) {
++			return EIO;
++		}
++		mask |= 1u << id;
++		x[id] = px;
++		y[id] = py;
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++static void
++touch_thread(__unused void *arg, __unused wait_result_t result)
++{
++	unsigned delay_s = 45;
++	/* Late start: if the bus access hangs the SoC, the GUI and the log got there first. */
++	(void)PE_parse_boot_argn("onclitetouchdelay", &delay_s, sizeof(delay_s));
++	printf("ONCLITE TOUCH: starting in %u s\n", delay_s);
++	touch_wait(delay_s * 1000u);
++	ot.gcc = ml_io_map(TOUCH_GCC_PA, TOUCH_GCC_SIZE);
++	ot.tlmm = ml_io_map(TOUCH_TLMM_PA, TOUCH_TLMM_SIZE);
++	ot.qup = ml_io_map(TOUCH_QUP_PA, TOUCH_QUP_SIZE);
++	if (!ot.gcc || !ot.tlmm || !ot.qup) {
++		printf("ONCLITE TOUCH: MMIO mapping failed\n");
++		goto out;
++	}
++	printf("ONCLITE TOUCH: before: vote %#x ahb %#x qup3 cbcr %#x rcg %#x/%#x gpio10 %#x gpio11 %#x reset %#x/%#x int %#x/%#x\n",
++	    rd32(ot.gcc, GCC_BRANCH_ENA_VOTE), rd32(ot.gcc, GCC_BLSP1_AHB_CBCR),
++	    rd32(ot.gcc, GCC_QUP3_I2C_CBCR), rd32(ot.gcc, GCC_QUP3_I2C_CMD_RCGR),
++	    rd32(ot.gcc, GCC_QUP3_I2C_CFG_RCGR), rd32(ot.tlmm, TLMM_CFG(GPIO_SDA)),
++	    rd32(ot.tlmm, TLMM_CFG(GPIO_SCL)), rd32(ot.tlmm, TLMM_CFG(GPIO_RESET)),
++	    rd32(ot.tlmm, TLMM_IO(GPIO_RESET)), rd32(ot.tlmm, TLMM_CFG(GPIO_INT)),
++	    rd32(ot.tlmm, TLMM_IO(GPIO_INT)));
++	if (!touch_clocks() || !qup_init()) {
++		goto out;
++	}
++	touch_gpio(GPIO_SDA, 2, 0, 2, false, false);    /* blsp_i2c3, no pull, 2 mA */
++	touch_gpio(GPIO_SCL, 2, 0, 2, false, false);
++	touch_gpio(GPIO_INT, 0, 3, 8, false, false);    /* input, pull-up */
++	/* focaltech_core.c fts_reset_proc(200): low 20 ms, high, 200 ms */
++	touch_gpio(GPIO_RESET, 0, 3, 8, true, false);
++	touch_wait(20);
++	touch_gpio(GPIO_RESET, 0, 3, 8, true, true);
++	touch_wait(200);
++	uint8_t idh = 0, idl = 0;
++	int e1 = EIO, e2 = EIO;
++	for (unsigned i = 0; i < 50; ++i) {
++		e1 = qup_read(FTS_ADDR, 0xa3, &idh, 1);
++		e2 = qup_read(FTS_ADDR, 0x9f, &idl, 1);
++		if (!e1 && !e2 && idh == 0x54) {
++			break;
++		}
++		touch_wait(20);
++	}
++	uint8_t fw = 0;
++	(void)qup_read(FTS_ADDR, 0xa6, &fw, 1);
++	printf("ONCLITE TOUCH: 0x38 chip id %02x:%02x (err %d/%d, i2c status %#x op %#x) firmware %#x\n",
++	    idh, idl, e1, e2, ot.i2c_status, ot.op, fw);
++	if (e1 || e2 || idh != 0x54) {
++		printf("ONCLITE TOUCH: no FT5446 (NACK on every try = touch power L10 off); stopping\n");
++		goto out;
++	}
++	/* Report = 3 header bytes + 6 per point; as many points as the FIFO takes. */
++	unsigned slots = (ot.in_fifo - 2u - 3u) / 6u;
++	ot.report_len = 3u + 6u * (slots < FTS_POINTS ? slots : FTS_POINTS);
++	printf("ONCLITE TOUCH: FT5446 ready, %u points, %ux%u -> canvas, poll 10 ms\n",
++	    (ot.report_len - 3u) / 6u, FTS_PANEL_W, FTS_PANEL_H);
++	unsigned errors = 0;
++	for (;;) {
++		int err = touch_poll();
++		if (err) {
++			if ((errors++ % 100u) == 0) {
++				printf("ONCLITE TOUCH: report err %d (i2c status %#x op %#x)\n", err, ot.i2c_status, ot.op);
++			}
++			if (errors == 10) {
++				touch_report(0, ot.x, ot.y);    /* release after persistent bad reads */
++			}
++		} else {
++			errors = 0;
++		}
++		touch_wait(10);
++	}
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++onclite_touch_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	if (ot.started) {
++		return;
++	}
++	ot.started = true;
++	(void)PE_parse_boot_argn("onclitetouch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("ONCLITE TOUCH: disabled (onclitetouch=0)\n");
++		return;
++	}
++	if (kernel_thread_start(touch_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("ONCLITE TOUCH: kernel_thread_start failed\n");
++	}
++}
++#endif /* ONCLITE */
