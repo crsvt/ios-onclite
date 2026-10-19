@@ -7,13 +7,19 @@
  *   - where LK's continuous-splash framebuffer is (read from the MDP5 pipes)
  * Everything runs with the MMU off (Device memory), so all accesses are
  * aligned (-mstrict-align). Text is white/grey only so RGB vs BGR does not
- * matter. After the countdown it reboots into fastboot.
+ * matter.
+ *
+ * v1 left the panel dark after `fastboot boot`, so every line also goes to
+ * the ramoops console zone (DT ramoops@91400000, console-size 2M, no dump
+ * zones). The probe then reboots into recovery, where the previous boot's
+ * text is /sys/fs/pstore/console-ramoops-0. The MDP read comes last.
  */
 #include <stdint.h>
 #include "../../shim/font.h"
 
 #define IMEM_RESTART_REASON	0x0860065cUL	/* qcom,msm-imem restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
+#define RESTART_RECOVERY	0x77665502U
 #define PSHOLD			0x004ab000UL
 
 #define MDP_BASE		0x01a00000UL
@@ -52,8 +58,12 @@
 #define PSCI_SYSTEM_SUSPEND	0xc400000eUL
 #define PSCI_SYSTEM_RESET2	0xc4000012UL
 
+#define RAMOOPS_CONSOLE		0x91400000UL
+#define RAMOOPS_CONSOLE_SIZE	0x200000UL
+#define PRZ_SIG			0x43474244U	/* "DBGC", fs/pstore/ram_core.c */
+
 #define NR_CPUS			8
-#define RESET_AFTER_S		120
+#define RESET_AFTER_S		3
 
 #define rsr(r) ({ uint64_t _v; __asm__ volatile("mrs %0, " r : "=r"(_v)); _v; })
 #define wsr(r, v) __asm__ volatile("msr " r ", %0" : : "r"((uint64_t)(v)))
@@ -79,7 +89,28 @@ extern char secondary_entry[];
 
 static uintptr_t fb;
 static uint32_t fb_w, fb_h, fb_stride, fb_bpp;
-static int row;
+static int row, fb_ok;
+
+/* struct persistent_ram_buffer { u32 sig; u32 start; u32 size; u8 data[]; } */
+static uint32_t plog_len;
+
+static void plog_init(void)
+{
+	wr32(RAMOOPS_CONSOLE, PRZ_SIG);
+	wr32(RAMOOPS_CONSOLE + 4, 0);
+	wr32(RAMOOPS_CONSOLE + 8, 0);
+	plog_len = 0;
+}
+
+static void plog_str(const char *s)
+{
+	while (*s && plog_len < RAMOOPS_CONSOLE_SIZE - 12)
+		wr8(RAMOOPS_CONSOLE + 12 + plog_len++, *s++);
+	/* no wrap: write position (start) == size */
+	wr32(RAMOOPS_CONSOLE + 4, plog_len);
+	wr32(RAMOOPS_CONSOLE + 8, plog_len);
+	dsb();
+}
 
 static void px(uint32_t x, uint32_t y, uint8_t g)
 {
@@ -119,9 +150,18 @@ static void put_char(int col, char ch, uint8_t g)
 
 static int put_str(int col, const char *s, uint8_t g)
 {
+	plog_str(s);
+	if (!fb_ok)
+		return col;
 	while (*s)
 		put_char(col++, *s++, g);
 	return col;
+}
+
+static void newline(void)
+{
+	plog_str("\n");
+	row++;
 }
 
 static void fmt_hex(char *buf, uint64_t v, int digits)
@@ -136,8 +176,9 @@ static void fmt_hex(char *buf, uint64_t v, int digits)
 static void line(const char *label, const char *s)
 {
 	put_str(0, label, DIM);
+	plog_str(": ");
 	put_str(LABEL_COLS, s, FG);
-	row++;
+	newline();
 }
 
 static void hex(const char *label, uint64_t v)
@@ -152,16 +193,18 @@ static void hex2(const char *label, const char *a, uint32_t va, const char *b, u
 {
 	char buf[9];
 	int col = put_str(0, label, DIM);
+	plog_str(": ");
 	col = col < LABEL_COLS ? LABEL_COLS : col + 1;
 	col = put_str(col, a, DIM);
 	fmt_hex(buf, va, 8);
 	col = put_str(col, buf, FG);
 	if (b) {
+		plog_str(" ");
 		col = put_str(col + 1, b, DIM);
 		fmt_hex(buf, vb, 8);
 		put_str(col, buf, FG);
 	}
-	row++;
+	newline();
 }
 
 /*
@@ -230,20 +273,11 @@ static void delay_ms(unsigned ms)
 		;
 }
 
-static void __attribute__((noreturn)) reset_to_fastboot(unsigned after_s)
+static void __attribute__((noreturn)) reset_to(uint32_t reason, unsigned after_s)
 {
-	char msg[] = "fastboot in 000s";
-	row++;
-	line("NEXT", "photo this screen;");
-	for (unsigned s = after_s; s; s--) {
-		msg[12] = '0' + s / 100;
-		msg[13] = '0' + s / 10 % 10;
-		msg[14] = '0' + s % 10;
-		line("", msg);
-		row--;
-		delay_ms(1000);
-	}
-	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
+	line("RESET", reason == RESTART_RECOVERY ? "to recovery" : "to fastboot");
+	delay_ms(after_s * 1000);
+	wr32(IMEM_RESTART_REASON, reason);
 	dsb();
 	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
 	wr32(PSHOLD, 0);
@@ -281,7 +315,7 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 		irq_handler();
 		return;
 	}
-	row++;
+	newline();
 	switch (slot & 3) {
 	case 0: line("PANIC", "SYNC"); break;
 	case 1: line("PANIC", "IRQ"); break;
@@ -294,7 +328,7 @@ void exc_handler(uint64_t slot, uint64_t *regs)
 	hex("ELR", rsr("elr_el1"));
 	hex("FAR", rsr("far_el1"));
 	hex("X0", regs[0]);
-	reset_to_fastboot(60);
+	reset_to(RESTART_RECOVERY, RESET_AFTER_S);
 }
 
 /* ---- CPU features ---- */
@@ -425,17 +459,25 @@ static void gic(void)
 
 void probe_main(uint64_t dtb)
 {
-	stage = "fb";
-	fb_find();
-	con_clear();
-	line("ONCLITE", "probe v1");
-	hex2("FB", "addr=", fb, "pipe=", fb_pipe);
-	hex2("FB", "w=", fb_w, "h=", fb_h);
-	hex2("FB", "strd=", fb_stride, "fmt=", fb_fmt);
+	stage = "start";
+	plog_init();
+	line("ONCLITE", "probe v2");
 	hex("DTB", dtb);
 	features();
 	psci();
 	smp();
 	gic();
-	reset_to_fastboot(RESET_AFTER_S);
+	stage = "mdp read";
+	line("STAGE", stage);
+	fb_find();
+	hex2("FB", "addr=", fb, "pipe=", fb_pipe);
+	hex2("FB", "w=", fb_w, "h=", fb_h);
+	hex2("FB", "strd=", fb_stride, "fmt=", fb_fmt);
+	stage = "fb draw";
+	line("STAGE", stage);
+	fb_ok = 1;
+	con_clear();
+	line("ONCLITE", "probe v2 done");
+	line("DONE", "all stages");
+	reset_to(RESTART_RECOVERY, RESET_AFTER_S);
 }

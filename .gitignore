@@ -11,3 +11,4 @@ __pycache__/
 # agent-local data: device dumps, fresh kernel clones, tools
 .claude/
 onclite/probe/out/
+logs/

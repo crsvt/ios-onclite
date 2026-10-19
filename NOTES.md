@@ -44,8 +44,25 @@ Phase 0 results (2026-10-19). User: keep everything in this folder, do not push 
   VIG0/RGB0/RGB1/DMA0 to find LK's splash (fallback 0x90001000 720x1520 RGB888), prints MIDR/MPIDR/MMFR0-2/ISAR0-1/PFR0/
   CNTFRQ with a 16K-granule verdict, PSCI version/features, CPU_ON for MPIDR 1-3,0x100-0x103 (each reports its MMFR0),
   GICv2 regs and vtimer (INTID 20) / ptimer (19) IRQ counts over 300 ms (30 = ok); then reboots to fastboot after 120 s
-  (IMEM 0x0860065c = 0x77665500, PSCI SYSTEM_RESET). NOT YET RUN on the device.
-Next: user runs `fastboot boot onclite/probe/out/probe-boot.img` and photographs the screen; decide 16K vs 4K-page XNU.
+  (IMEM 0x0860065c = 0x77665500, PSCI SYSTEM_RESET).
+- Probe v1 run (2026-10-19): panel stayed dark (LK turns the display off on `fastboot boot`; MDP pipe registers stay
+  readable), back in fastboot ~64 s later. No result on screen.
+- **Probe v2** logs every line into the ramoops console zone (0x91400000: u32 sig 0x43474244 "DBGC", u32 start, u32 size,
+  text at +12; no wrap -> start == size), MDP read last, then PSCI reset. Read back from the next Linux boot:
+  `adb root; adb exec-out cat /sys/fs/pstore/console-ramoops-0` (works in Lineage userdebug). Restart reason 0x77665502
+  did NOT give recovery: LK booted Lineage (~20 s). Saved as `logs/probe-v2.txt` (gitignored). All stages passed:
+  - boot CPU cpu0 MIDR 0x51AF8014, MPIDR 0x80000000, EL1, SCTLR 0x00C00800, DTB at 0x43400000, CNTFRQ 19.2 MHz.
+  - **Silver cpu0-3 (part 0x801): MMFR0 0x1122 = no 16K. Gold cpu4-7 (part 0x800, MIDR 0x51AF8002): MMFR0 0x00101122 =
+    16K granule SUPPORTED.** ISAR0 0x11120 on both (no atomics), PFR0 0x2222 (no FP16).
+  - PSCI 1.0, MIGRATE_INFO_TYPE NOT_SUPPORTED (no resident trusted OS -> cpu0 may CPU_OFF), CPU_SUSPEND ok,
+    SYSTEM_SUSPEND/RESET2 unsupported. CPU_ON ok for all 7 (MPIDR 1-3, 0x100-0x103).
+  - GICv2: GICD_TYPER 0x4EA (352 IRQs, 8 CPUs, SecurityExtn), GICD_IIDR 0x1070, GICC_IIDR 0x20070; NS enables stick.
+    vtimer INTID 20 and ptimer INTID 19 each 29 IRQs/300 ms via GICC_IAR/EOIR (Group 1, NS).
+  - LK splash: MDP RGB0 pipe, 0x90001000, 720x1520, stride 2160, SRC_FORMAT 0x2243F = RGB888 (3 bytes/px).
+Decision: run XNU with 16K pages on the gold cluster only. The shim boots on cpu0, CPU_ONs MPIDR 0x100 and enters XNU
+there; cpus=4 (0x100-0x103); silver cores stay off (cpu0 CPU_OFF or WFI). No 4K-page XNU needed.
+Open: why LK ignores IMEM 0x77665502 (check PMIC PON_SOFT_RB_SPARE reboot reason); panel output after `fastboot boot`
+needs a DSI/panel re-enable or a flashed boot (ask the user first).
 
 ## Agent handoff / active work (2026-10-15, latest)
 
