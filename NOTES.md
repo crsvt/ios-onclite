@@ -171,6 +171,11 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   arbiter v2 (core 0x200f000 map 0x800+4n ppid 0x008, cnfg 0x200a000+0x700+4n owner, chnls 0x2400000/obsrvr
   0x2c00000 + 0x8000*apid, ee 0) before PS_HOLD. Default: recovery (TWRP from the recovery partition; read pstore
   there). Boot-arg onclite_reset_to=normal|recovery|fastboot. backup/recovery.img (TWRP) added, sha ok.
+- C7 (19:34 UTC): SPMI works (PON = channel 40, owner EE 0; SOFT_RB_SPARE read 0x0, write rc 0) but the reset
+  still booted Lineage. Lineage regmap debugfs (/sys/kernel/debug/regmap/spmi0-00/registers): PS_HOLD_RESET_CTL
+  0x85a = 0x08 (DVDD hard reset), 0x85b = 0x80. `adb reboot recovery` -> TWRP 3.7.1 in 35 s: Linux switches the
+  PS_HOLD reset to warm first (qpnp_pon_reset_config). 0105 now does the same: 0x85b=0, 500 us, 0x85a=(x&~0xf)|1,
+  0x85b=0x80, then SOFT_RB_SPARE (read back logged), then PS_HOLD.
 - Root image on the Mac: `research/ios-root/ios16-root.img` (SHA256 6995911b...c073d verified after rsync);
   deleted on the server (its ~/ios-onclite-root keeps tools/src/log only).
 - **iOS ROOT IMAGE BUILT on the server (2026-10-19 18:44-18:50 UTC):** `~/ios-onclite-root/build-root.sh` (copy in the

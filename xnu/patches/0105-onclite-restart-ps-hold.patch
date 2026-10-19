@@ -1,8 +1,8 @@
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..0349d5d 100644
+index 0631685..b15dcf4 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -10,6 +10,149 @@
+@@ -10,6 +10,190 @@
  #include <IOKit/IODeviceTreeSupport.h>
  #include <IOKit/IOLib.h>
  
@@ -42,6 +42,10 @@ index 0631685..0349d5d 100644
 +#define SPMI_OP_READL           1u
 +#define PON_PPID                0x008           /* SID 0, peripheral 0x08 (PON) */
 +#define PON_SOFT_RB_SPARE       0x8f
++#define PON_PS_HOLD_RESET_CTL   0x5a            /* [3:0] type: 1 warm, 7 hard, 8 DVDD hard (as left) */
++#define PON_PS_HOLD_RESET_CTL2  0x5b            /* bit 7: enable */
++#define PON_RESET_TYPE_WARM     1
++#define PON_RESET_EN            0x80
 +#define LK_MODE_NORMAL          0
 +#define LK_MODE_RECOVERY        1
 +#define LK_MODE_FASTBOOT        2
@@ -67,12 +71,12 @@ index 0631685..0349d5d 100644
 +}
 +
 +static int
-+onclite_pon_read(uint8_t *value)
++onclite_pon_read(uint8_t reg, uint8_t *value)
 +{
 +	if (!onclite_spmi_obsrvr) {
 +		return -1;
 +	}
-+	*(volatile uint32_t *)(onclite_spmi_obsrvr + SPMI_CMD) = (SPMI_OP_READL << 27) | (PON_SOFT_RB_SPARE << 4);
++	*(volatile uint32_t *)(onclite_spmi_obsrvr + SPMI_CMD) = (SPMI_OP_READL << 27) | ((uint32_t)reg << 4);
 +	int rc = onclite_spmi_wait(onclite_spmi_obsrvr);
 +	if (!rc) {
 +		*value = (uint8_t)*(volatile uint32_t *)(onclite_spmi_obsrvr + SPMI_RDATA0);
@@ -81,14 +85,42 @@ index 0631685..0349d5d 100644
 +}
 +
 +static int
-+onclite_pon_write(uint8_t value)
++onclite_pon_write(uint8_t reg, uint8_t value)
 +{
 +	if (!onclite_spmi_chnl) {
 +		return -1;
 +	}
 +	*(volatile uint32_t *)(onclite_spmi_chnl + SPMI_WDATA0) = value;
-+	*(volatile uint32_t *)(onclite_spmi_chnl + SPMI_CMD) = (SPMI_OP_WRITEL << 27) | (PON_SOFT_RB_SPARE << 4);
++	*(volatile uint32_t *)(onclite_spmi_chnl + SPMI_CMD) = (SPMI_OP_WRITEL << 27) | ((uint32_t)reg << 4);
 +	return onclite_spmi_wait(onclite_spmi_chnl);
++}
++
++/*
++ * PS_HOLD reset type warm, as Linux qpnp_pon_reset_config() does before a
++ * reboot with a reason: LK leaves DVDD hard reset (8), which does not keep
++ * SOFT_RB_SPARE for LK (C7: reset landed in Android). Disable, wait 10 sleep
++ * clock cycles, set the type, enable.
++ */
++static int
++onclite_pon_warm_reset(uint8_t *ctl_out)
++{
++	uint8_t ctl = 0;
++	int rc = onclite_pon_read(PON_PS_HOLD_RESET_CTL, &ctl);
++	if (!rc) {
++		rc = onclite_pon_write(PON_PS_HOLD_RESET_CTL2, 0);
++	}
++	if (!rc) {
++		IODelay(500);
++		rc = onclite_pon_write(PON_PS_HOLD_RESET_CTL, (uint8_t)((ctl & ~0xf) | PON_RESET_TYPE_WARM));
++	}
++	if (!rc) {
++		rc = onclite_pon_write(PON_PS_HOLD_RESET_CTL2, PON_RESET_EN);
++	}
++	if (!rc) {
++		rc = onclite_pon_read(PON_PS_HOLD_RESET_CTL, &ctl);
++	}
++	*ctl_out = ctl;
++	return rc;
 +}
 +
 +/* Find the PON channel (apid) and map its write/read windows. */
@@ -124,13 +156,22 @@ index 0631685..0349d5d 100644
 +	    type == kPEPanicEnd || onclite_pshold == NULL) {
 +		return 0;
 +	}
-+	uint8_t spare = 0;
-+	int rc = onclite_pon_read(&spare);
-+	if (!rc && onclite_reset_mode != LK_MODE_NORMAL) {
-+		rc = onclite_pon_write((uint8_t)((spare & 3) | (onclite_reset_mode << 2)));
++	uint8_t spare = 0, ctl = 0, check = 0;
++	int rc = 0;
++	if (onclite_reset_mode != LK_MODE_NORMAL) {
++		rc = onclite_pon_warm_reset(&ctl);
++		if (!rc) {
++			rc = onclite_pon_read(PON_SOFT_RB_SPARE, &spare);
++		}
++		if (!rc) {
++			rc = onclite_pon_write(PON_SOFT_RB_SPARE, (uint8_t)((spare & 3) | (onclite_reset_mode << 2)));
++		}
++		if (!rc) {
++			rc = onclite_pon_read(PON_SOFT_RB_SPARE, &check);
++		}
 +	}
-+	kprintf("ONCLITE: restart (type %u) via PS_HOLD, LK mode %u (SOFT_RB_SPARE 0x%x, spmi %d)\n",
-+	    type, onclite_reset_mode, spare, rc);
++	kprintf("ONCLITE: restart (type %u) via PS_HOLD, LK mode %u: reset ctl 0x%x, SOFT_RB_SPARE 0x%x -> 0x%x "
++	    "(spmi %d)\n", type, onclite_reset_mode, ctl, spare, check, rc);
 +	__builtin_arm_dsb(DSB_SY);
 +	*onclite_pshold = 0;
 +	__builtin_arm_dsb(DSB_SY);
@@ -152,7 +193,7 @@ index 0631685..0349d5d 100644
  class SweetPlatformExpert : public IODTPlatformExpert {
  	OSDeclareDefaultStructors(SweetPlatformExpert);
  
-@@ -31,6 +174,30 @@ SweetPlatformExpert::start(IOService *provider)
+@@ -31,6 +215,30 @@ SweetPlatformExpert::start(IOService *provider)
  	}
  	registerService();
  	IOLog("SWEET: platform expert registered\n");
@@ -163,7 +204,7 @@ index 0631685..0349d5d 100644
 +	    !strcmp(mode, "fastboot") ? LK_MODE_FASTBOOT : LK_MODE_RECOVERY;
 +	onclite_spmi_init();
 +	uint8_t spare = 0;
-+	int spmi_rc = onclite_pon_read(&spare);
++	int spmi_rc = onclite_pon_read(PON_SOFT_RB_SPARE, &spare);
 +	IOLog("ONCLITE: PON SOFT_RB_SPARE 0x%x (spmi %d), restarts go to LK mode %u\n",
 +	    spare, spmi_rc, onclite_reset_mode);
 +	onclite_pshold = (volatile uint32_t *)ml_io_map(ONCLITE_PSHOLD_PA, PAGE_SIZE);
