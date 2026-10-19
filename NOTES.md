@@ -126,7 +126,7 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   `4/4 CPUs initialized` -> `BSD root: md0` -> `*** SWEET userspace: init running as PID 1 ***` -> 79 heartbeats
   (every 5 s) until the manual reset, no panic. SMP on the whole Gold cluster, exec, code signature, syscalls, devfs
   console all work on hardware. Next: eMMC (SDHCI) driver for the userdata root; reset via PS_HOLD.
-- TWO PHONES may be on USB (a Mi A2 `jasmine_sprout` too): always `export ANDROID_SERIAL=$(cat .claude/device/adb-serial)` for adb/fastboot.
+- TWO PHONES may be on USB (a Mi A2 `jasmine_sprout` too): always `export ANDROID_SERIAL=$(cat .claude/device/adb-serial)` (Redmi 7 serial, kept out of git) for adb/fastboot.
 - Not done yet: xnu reboot via PS_HOLD (panic just stops; warm-reset by hand), display (Phase 3), eMMC root.
 - CI: `.github/workflows/xnu.yml` also triggers on branch `onclite-ci` with MACHINE_CONFIG=ONCLITE
   (-> kernel.development.onclite). crsvt/ios-onclite is PUBLIC: check pushes for serials/IMEI/calibration first.
