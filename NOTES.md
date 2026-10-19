@@ -109,6 +109,10 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
 - CI run 39285920519 (39973f3): BearSSL headers missing -> the staging scripts 0019/0020/0026 (libpthread,
   BearSSL, HFS) exit early unless MACHINE_CONFIG == SWEET, so ONCLITE also lost patches 0031/0041 ("Skipping patch").
   Fixed: they run for SWEET or ONCLITE.
+- CI run 39287859996 (35f9f82) BUILT kernel.development.onclite (`xnu/out-onclite-3`, 17.5 MB, SHA256SUMS ok) but
+  libfirehose_kernel.a (libdispatch, built by xcodebuild without MACHINE_FLAGS) has LSE in 10 firehose functions
+  (kernel os_log) -> would fault in kernel mode. Workflow now appends OTHER_CFLAGS[arch=arm64] ... -mcpu=cortex-a73
+  to its xcconfig for ONCLITE, and an "ISA check" step lists any ARMv8.1+ instruction (K256 = data, expected).
 - Not done yet: xnu reboot via PS_HOLD (panic just stops; warm-reset by hand), display (Phase 3), eMMC root.
 - CI: `.github/workflows/xnu.yml` also triggers on branch `onclite-ci` with MACHINE_CONFIG=ONCLITE
   (-> kernel.development.onclite). crsvt/ios-onclite is PUBLIC: check pushes for serials/IMEI/calibration first.

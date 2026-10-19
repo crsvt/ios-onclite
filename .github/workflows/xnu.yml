@@ -52,6 +52,23 @@ jobs:
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          if [ "$MACHINE_CONFIG" = ONCLITE ]; then
+            # libfirehose_kernel (libdispatch, built by xcodebuild) does not get the kernel's
+            # MACHINE_FLAGS: its arm64 slice would default to an Apple CPU and use LSE atomics,
+            # which Kryo 250 (ARMv8.0) cannot run in kernel mode.
+            python3 - <<'PY'
+          import re
+          p = 'dxb/build.sh'
+          s = open(p).read()
+          anchor = re.search(r'\n(\s*)sed -i \'\' \'s\|\$\(SDKROOT\)/usr/local/include\|[^\n]*libfirehose_kernel\.xcconfig"\n', s)
+          assert anchor, 'libfirehose_kernel xcconfig sed not found in build.sh'
+          line = (anchor.group(1) + 'printf \'%s\\n\' \'OTHER_CFLAGS[arch=arm64] = -mkernel -nostdinc -Wno-packed -mcpu=cortex-a73\''
+                  ' >> "${SRCROOT}/xcodeconfig/libfirehose_kernel.xcconfig"\n')
+          s = s[:anchor.end()] + line.lstrip('\n') + s[anchor.end():]
+          open(p, 'w').write(s)
+          PY
+            grep -n 'cortex-a73' dxb/build.sh
+          fi
           ls dxb/patches
 
       - name: Deps
@@ -116,6 +133,20 @@ jobs:
           cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+
+      - name: ISA check (ONCLITE, ARMv8.0)
+        if: always() && env.MACHINE_CONFIG == 'ONCLITE'
+        run: |
+          # Kryo 250 has no LSE/RCpc/PAC: list any such instruction by function.
+          # K256 (SHA-256 constants in __text) is data that happens to decode.
+          k=out/kernel.development.onclite
+          [ -f "$k" ] || exit 0
+          xcrun objdump -d --no-show-raw-insn "$k" | awk '
+            /^[0-9a-f]+ </ { fn = $2; next }
+            $2 ~ /^(cas[abhlp]*|ld(add|clr|eor|set|smax|smin|umax|umin)[alhb]*|st(add|clr|eor|set|smax|smin|umax|umin)[lhb]*|swp[alhb]*|ldapr[bh]?|pac[a-z0-9]*|aut[a-z0-9]*|retaa|retab|braa|blraa)$/ { print fn, $2 }
+          ' | sort | uniq -c > out/isa-check.txt
+          cat out/isa-check.txt
+          echo "functions with ARMv8.1+ instructions: $(grep -vc '<K256>' out/isa-check.txt || true)"
 
       - uses: actions/upload-artifact@v4
         if: always()
