@@ -155,6 +155,12 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   linux-modules-extra-6.8.0-1070-gcp (hfsplus), cmake/fuse3 dev; apfs-fuse built (sgan81 66b86bd) ->
   /usr/local/bin. Work dir ~/ios-onclite-root/{tools,src,ipsw}. It stopped answering (no ssh, no ping) ~5 min after
   boot, as on 10-19 earlier: likely spot/preemptible VM or GCP firewall.
+- **iOS ROOT IMAGE BUILT on the server (2026-10-19 18:44-18:50 UTC):** `~/ios-onclite-root/build-root.sh` (copy in the
+  session scratchpad; remotezip of OS 087-86698-044, SystemOS 087-86593-047, AppOS 087-86715-047 from the 20H392 IPSW,
+  names from BuildManifest D22AP erase identity) -> tools/mkiosroot.sh 16G -> fsck OK -> sweet-root-tweaks.py ->
+  fsck OK. `ios16-root.img` 16 GiB apparent / 12 GiB data, SHA256 6995911b...c073d. mkiosroot's cleanup left the
+  three apfs-fuse mounts (root-owned, its mountpoint check runs as the user), which kept the deleted dmgs' 7.5 GB
+  allocated: unmounted by hand. Downloading to `research/ios-root/` (gitignored); delete it on the server after.
 - Reference (user, 2026-10-19): https://github.com/dipa-studio/ios-extra = sweet's driver playground (Adreno 618
   GPU bring-up: GMU, power, SMMU; docs/GPU_API_RE.md on how this iOS image loads Metal device plugins). onclite has
   an Adreno 506 (different generation); only the iOS-side GPU/Metal research carries over, later.
