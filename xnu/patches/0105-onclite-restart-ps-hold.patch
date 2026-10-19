@@ -1,8 +1,8 @@
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..b15dcf4 100644
+index 0631685..09cf515 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -10,6 +10,190 @@
+@@ -10,6 +10,199 @@
  #include <IOKit/IODeviceTreeSupport.h>
  #include <IOKit/IOLib.h>
  
@@ -184,7 +184,16 @@ index 0631685..b15dcf4 100644
 +onclite_reboot_timer(void *arg, wait_result_t wr __unused)
 +{
 +	uint32_t secs = (uint32_t)(uintptr_t)arg;
-+	IOSleep(secs * 1000);
++	/*
++	 * Sleep a minute at a time: a single IOSleep of 1800 s hung the boot
++	 * right after AppleCLCD twice (E3, E3b) while 480 s and 600 s worked
++	 * (ns * 19.2 MHz overflows 64 bits above ~960 s).
++	 */
++	for (uint32_t left = secs; left != 0;) {
++		uint32_t step = left > 60 ? 60 : left;
++		IOSleep(step * 1000);
++		left -= step;
++	}
 +	IOLog("ONCLITE: onclite_reboot_after=%u expired, restarting\n", secs);
 +	PEHaltRestart(kPERestartCPU);
 +}
@@ -193,7 +202,7 @@ index 0631685..b15dcf4 100644
  class SweetPlatformExpert : public IODTPlatformExpert {
  	OSDeclareDefaultStructors(SweetPlatformExpert);
  
-@@ -31,6 +215,30 @@ SweetPlatformExpert::start(IOService *provider)
+@@ -31,6 +224,30 @@ SweetPlatformExpert::start(IOService *provider)
  	}
  	registerService();
  	IOLog("SWEET: platform expert registered\n");
