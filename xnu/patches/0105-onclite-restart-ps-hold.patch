@@ -1,8 +1,8 @@
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..c4de0fb 100644
+index 0631685..01d32aa 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -9,6 +9,322 @@
+@@ -9,6 +9,465 @@
  #include <IOKit/IOPlatformExpert.h>
  #include <IOKit/IODeviceTreeSupport.h>
  #include <IOKit/IOLib.h>
@@ -306,6 +306,149 @@ index 0631685..c4de0fb 100644
 +	return kIOReturnSuccess;
 +}
 +
++/*
++ * Gold (perf) cluster clock. The shim moves the Gold mux to GPLL0 (800 MHz,
++ * no voltage change). Boot-arg onclite_goldmhz=N programs the C1 PLL to
++ * ~N MHz and switches the mux to it, but only when VDD_APC (PM8953 S5, shared
++ * by both clusters and the CCI, no CPR here) is at least the CPR ceiling of
++ * that corner (Linux sdm632 tables; .claude/research/gold-clock-report.md).
++ */
++#define GOLD_MUX_CMD    0x0b011050UL
++#define GOLD_MUX_CFG    0x0b011054UL
++#define GOLD_CBCR       0x0b011058UL
++#define GOLD_PLL        0x0b016000UL
++#define SPEED_BIN_FUSE  0x000a4124UL
++
++static const struct { uint32_t mhz10, l, ceiling_mv; } gold_corners[] = {
++	{ 9024, 0x2f, 790 }, { 10944, 0x39, 865 }, { 14016, 0x49, 865 },
++	{ 15552, 0x51, 920 }, { 18048, 0x5e, 990 },
++};
++
++/* VDD_APC in mV from S5 (SPMI SID 1 periph 0x20), or 0 if not decodable. */
++static uint32_t
++onclite_vdd_apc_mv(void)
++{
++	vm_offset_t core = ml_io_map(SPMI_CORE_PA, 0x1000);
++	if (!core) {
++		return 0;
++	}
++	uint32_t apid;
++	for (apid = 0; SPMI_APID_MAP(apid) < 0x1000; apid++) {
++		uint32_t map = *(volatile uint32_t *)(core + SPMI_APID_MAP(apid));
++		if (map != 0 && ((map >> 8) & 0xfff) == 0x120) {
++			break;
++		}
++	}
++	if (SPMI_APID_MAP(apid) >= 0x1000) {
++		return 0;
++	}
++	vm_offset_t obs = ml_io_map(SPMI_OBSRVR_PA + 0x8000 * apid, 0x1000);
++	if (!obs) {
++		return 0;
++	}
++	static const uint8_t regs[] = { 0x04, 0x05, 0x40, 0x41 };
++	uint8_t v[4];
++	for (unsigned i = 0; i < 4; i++) {
++		*(volatile uint32_t *)(obs + SPMI_CMD) = (SPMI_OP_READL << 27) | ((uint32_t)regs[i] << 4);
++		if (onclite_spmi_wait(obs)) {
++			return 0;
++		}
++		v[i] = (uint8_t)*(volatile uint32_t *)(obs + SPMI_RDATA0);
++	}
++	uint32_t uv = 0;
++	if (v[0] == 0x1c && v[1] == 0x09) {             /* FTS2.5 */
++		uv = v[2] == 0 ? 80000 + 5000 * v[3] : 160000 + 10000 * v[3];
++	} else if (v[0] == 0x1c && v[1] == 0x08) {      /* FTS2 */
++		uv = v[2] == 0 ? 5000 * v[3] : 10000 * v[3];
++	} else if (v[0] == 0x03 && v[1] == 0x08) {      /* HF buck */
++		uv = 375000 + 12500 * v[3];
++	}
++	IOLog("ONCLITE: VDD_APC S5 type 0x%02x/0x%02x range %u vset 0x%02x -> %u mV\n",
++	    v[0], v[1], v[2], v[3], uv / 1000);
++	return uv / 1000;
++}
++
++static void
++onclite_gold_clock(void)
++{
++	uint32_t want = 0;
++	if (!PE_parse_boot_argn("onclite_goldmhz", &want, sizeof(want)) || want == 0) {
++		IOLog("ONCLITE: Gold cluster stays on GPLL0 800 MHz (onclite_goldmhz not set)\n");
++		(void)onclite_vdd_apc_mv();
++		return;
++	}
++	vm_offset_t clk = ml_io_map(GOLD_MUX_CMD & ~0xfffUL, 0x1000);
++	vm_offset_t pll = ml_io_map(GOLD_PLL, 0x1000);
++	vm_offset_t fuse = ml_io_map(SPEED_BIN_FUSE & ~0xfffUL, 0x1000);
++	if (!clk || !pll || !fuse) {
++		return;
++	}
++	uint32_t mv = onclite_vdd_apc_mv();
++	unsigned pick = ~0u;
++	for (unsigned i = 0; i < sizeof(gold_corners) / sizeof(gold_corners[0]); i++) {
++		if (gold_corners[i].mhz10 <= want * 10 + 5 && mv >= gold_corners[i].ceiling_mv) {
++			pick = i;
++		}
++	}
++	uint32_t bin = (*(volatile uint32_t *)(fuse + (SPEED_BIN_FUSE & 0xfff)) >> 8) & 7;
++	if (pick == ~0u) {
++		IOLog("ONCLITE: Gold %u MHz refused: VDD_APC %u mV below its CPR ceiling (bin %u)\n", want, mv, bin);
++		return;
++	}
++	volatile uint32_t *cfg = (volatile uint32_t *)(clk + (GOLD_MUX_CFG & 0xfff));
++	volatile uint32_t *cmd = (volatile uint32_t *)(clk + (GOLD_MUX_CMD & 0xfff));
++	if (((*cfg >> 8) & 7) == 5) {
++		IOLog("ONCLITE: Gold mux already on its PLL (cfg 0x%x); left alone\n", *cfg);
++		return;
++	}
++	volatile uint32_t *mode = (volatile uint32_t *)pll;
++	if (*mode & 7) {
++		*mode &= ~1u; *mode &= ~4u; *mode &= ~2u;
++	}
++	*(volatile uint32_t *)(pll + 0x18) |= 0x9;
++	*(volatile uint32_t *)(pll + 0x10) = 0;
++	*(volatile uint32_t *)(pll + 0x20) = 0x200D4828;
++	*(volatile uint32_t *)(pll + 0x24) = 0x6;
++	*(volatile uint32_t *)(pll + 0x30) = 0x1C000000;
++	*(volatile uint32_t *)(pll + 0x34) = 0x4000;
++	*(volatile uint32_t *)(pll + 0x08) = gold_corners[pick].l;
++	__builtin_arm_dsb(DSB_SY);
++	*mode |= 2; __builtin_arm_dsb(DSB_SY); IODelay(10);
++	*mode |= 4; __builtin_arm_dsb(DSB_SY); IODelay(200);
++	bool locked = false;
++	for (int i = 0; i < 200 && !locked; i++) {
++		locked = (*mode & (1u << 31)) != 0;
++		IODelay(1);
++		locked = locked && (*mode & (1u << 31)) != 0;
++	}
++	if (!locked) {
++		*mode &= ~4u; *mode &= ~2u;
++		IOLog("ONCLITE: Gold PLL L 0x%x did not lock (mode 0x%x); stays at 800 MHz\n", gold_corners[pick].l, *mode);
++		return;
++	}
++	*mode |= 1; __builtin_arm_dsb(DSB_SY);
++	*cfg = 0x501;                   /* source 5 = C1 PLL, /1 */
++	__builtin_arm_dsb(DSB_SY);
++	*cmd |= 1;
++	int i;
++	for (i = 0; i < 500 && (*cmd & 1); i++) {
++		IODelay(1);
++	}
++	IOLog("ONCLITE: Gold cluster at %u.%u MHz (L 0x%x, VDD_APC %u mV, bin %u, mux cfg 0x%x%s)\n",
++	    gold_corners[pick].mhz10 / 10, gold_corners[pick].mhz10 % 10, gold_corners[pick].l, mv, bin, *cfg,
++	    (*cmd & 1) ? ", UPDATE STUCK" : "");
++}
++
++/* The boot-time PMIC report predates the USB live log's backlog: repeat it. */
++static void
++onclite_ldo_report_later(void *arg __unused, wait_result_t wr __unused)
++{
++	IOSleep(60 * 1000);
++	IOLog("ONCLITE: PMIC report again, 60 s after boot\n");
++	onclite_ldo_report();
++	(void)onclite_vdd_apc_mv();
++}
++
 +static void
 +onclite_network_stack_publish(IOService *provider)
 +{
@@ -325,7 +468,7 @@ index 0631685..c4de0fb 100644
  
  class SweetPlatformExpert : public IODTPlatformExpert {
  	OSDeclareDefaultStructors(SweetPlatformExpert);
-@@ -31,6 +347,32 @@ SweetPlatformExpert::start(IOService *provider)
+@@ -31,6 +490,37 @@ SweetPlatformExpert::start(IOService *provider)
  	}
  	registerService();
  	IOLog("SWEET: platform expert registered\n");
@@ -354,6 +497,11 @@ index 0631685..c4de0fb 100644
 +	IOLog("ONCLITE: restart via PS_HOLD %s, reboot timer %u s\n",
 +	    onclite_pshold != NULL ? "ready" : "UNAVAILABLE", secs);
 +	onclite_network_stack_publish(this);
++	onclite_gold_clock();
++	thread_t later;
++	if (kernel_thread_start(onclite_ldo_report_later, NULL, &later) == KERN_SUCCESS) {
++		thread_deallocate(later);
++	}
 +#endif
  	return true;
  }
