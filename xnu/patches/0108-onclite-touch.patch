@@ -1,9 +1,9 @@
 diff --git a/bsd/dev/onclite_touch.c b/bsd/dev/onclite_touch.c
 new file mode 100644
-index 0000000..52ef3a8
+index 0000000..e692874
 --- /dev/null
 +++ b/bsd/dev/onclite_touch.c
-@@ -0,0 +1,494 @@
+@@ -0,0 +1,820 @@
 +/*
 + * onclite touch: FocalTech FT5446 (I2C 0x38) on BLSP1 QUP3 (0x78b7000).
 + *
@@ -103,11 +103,22 @@ index 0000000..52ef3a8
 +#define TAG_START               0x81u
 +#define TAG_WRITE               0x82u
 +#define TAG_READ_N_STOP         0x87u
++#define TAG_WRITE_STOP          0x83u
 +
 +#define FTS_ADDR                0x38u
 +#define FTS_POINTS              10u
 +#define FTS_PANEL_W             720
 +#define FTS_PANEL_H             1520
++
++/* Goodix GT1151Q, the other onclite touch variant (stock gt1151q/gt1x_generic.c) */
++#define GT1X_ADDR           0x14u
++#define GT1X_REG_STATUS     0x814Eu
++#define GT1X_REG_POINT      0x814Fu
++#define GT1X_STATUS_READY   0x80u
++#define GT1X_STATUS_COUNT   0x0Fu
++#define GT1X_POINT_SIZE     8u
++#define GT1X_MAX_POINTS     FTS_POINTS
++#define GT1X_MAX_REPORT     (GT1X_MAX_POINTS * GT1X_POINT_SIZE)
 +/* SweetFramebuffer.cpp (ONCLITE): canvas 1125x2436 shown as 701x1520 at x = 9 */
 +#define CANVAS_W                1125
 +#define CANVAS_H                2436
@@ -325,6 +336,208 @@ index 0000000..52ef3a8
 +	return err;
 +}
 +
++/*
++ * Read a Goodix register using its 16-bit big-endian register address.
++ * Uses the existing QUP3 FIFO-mode transfer machinery.
++ */
++static int
++qup_read16(uint8_t addr, uint16_t reg, uint8_t *buf, unsigned len)
++{
++    if (buf == NULL || len == 0 || len + 2u > ot.in_fifo ||
++        len > 255 || ot.out_fifo < 12) {
++        return EINVAL;
++    }
++
++    if (!qup_state(QUP_STATE_RESET)) {
++        return EBUSY;
++    }
++
++    wr32(ot.qup, QUP_MX_OUTPUT_COUNT, 0);
++    wr32(ot.qup, QUP_MX_INPUT_COUNT, 0);
++    wr32(ot.qup, QUP_MX_WRITE_COUNT, 10);
++    wr32(ot.qup, QUP_MX_READ_COUNT, len + 2u);
++    wr32(ot.qup, QUP_CONFIG, QUP_CONFIG_I2C);
++    wr32(ot.qup, QUP_IO_MODES,
++        (rd32(ot.qup, QUP_IO_MODES) & ~0x1fc00u) | 0xc000u);
++    wr32(ot.qup, QUP_OPERATIONAL_MASK, QUP_OP_SERVICE);
++
++    if (!qup_state(QUP_STATE_RUN)) {
++        return EBUSY;
++    }
++
++    wr32(ot.qup, QUP_I2C_CLK_CTL, QUP_CLK_400K);
++
++    if (!qup_state(QUP_STATE_PAUSE)) {
++        (void)qup_state(QUP_STATE_RESET);
++        return EBUSY;
++    }
++
++    const uint8_t out[10] = {
++        TAG_START, (uint8_t)(addr << 1),
++        TAG_WRITE, 2,
++        (uint8_t)(reg >> 8), (uint8_t)reg,
++        TAG_START, (uint8_t)((addr << 1) | 1u),
++        TAG_READ_N_STOP, (uint8_t)len
++    };
++
++    for (unsigned i = 0; i < sizeof(out); i += 4) {
++        uint32_t word = 0;
++
++        for (unsigned j = 0; j < 4 && i + j < sizeof(out); ++j) {
++            word |= (uint32_t)out[i + j] << (8u * j);
++        }
++
++        wr32(ot.qup, QUP_OUT_FIFO, word);
++    }
++
++    if (!qup_state(QUP_STATE_RUN)) {
++        (void)qup_state(QUP_STATE_RESET);
++        return EBUSY;
++    }
++
++    int err = ETIMEDOUT;
++
++    for (unsigned i = 0; i < 10000; ++i) {
++        uint32_t st = rd32(ot.qup, QUP_I2C_STATUS);
++        uint32_t ef = rd32(ot.qup, QUP_ERROR_FLAGS);
++        uint32_t op = rd32(ot.qup, QUP_OPERATIONAL);
++
++        if ((st & QUP_I2C_ERRORS) || (ef & QUP_ERRORS)) {
++            ot.i2c_status = st;
++            ot.op = op;
++            err = (st & QUP_I2C_NACK) ? ENXIO : EIO;
++
++            wr32(ot.qup, QUP_I2C_STATUS, st & QUP_I2C_ERRORS);
++            wr32(ot.qup, QUP_ERROR_FLAGS, ef & QUP_ERRORS);
++            break;
++        }
++
++        if (op & QUP_OP_MAX_INPUT_DONE) {
++            unsigned got = 0;
++            unsigned total = len + 2u;
++
++            while (got < total) {
++                uint32_t word = rd32(ot.qup, QUP_IN_FIFO);
++
++                for (unsigned j = 0; j < 4 && got < total; ++j, ++got) {
++                    if (got >= 2) {
++                        buf[got - 2] =
++                            (uint8_t)(word >> (8u * j));
++                    }
++                }
++            }
++
++            wr32(ot.qup, QUP_OPERATIONAL, QUP_OP_SERVICE);
++            err = 0;
++            break;
++        }
++
++        delay(1);
++    }
++
++    if (err == ETIMEDOUT) {
++        ot.i2c_status = rd32(ot.qup, QUP_I2C_STATUS);
++        ot.op = rd32(ot.qup, QUP_OPERATIONAL);
++    }
++
++    (void)qup_state(QUP_STATE_RESET);
++    return err;
++}
++
++/*
++ * Write one byte to a Goodix 16-bit register.
++ *
++ * TAG_WRITE_STOP 0x83 is i2c-msm-v2's DATA_WRITE_N_STOP (verified); a
++ * write-only transfer sets NO_INPUT in QUP_CONFIG, as Linux does.
++ */
++static int
++qup_write16(uint8_t addr, uint16_t reg, uint8_t value)
++{
++    if (ot.out_fifo < 8) {
++        return EINVAL;
++    }
++
++    if (!qup_state(QUP_STATE_RESET)) {
++        return EBUSY;
++    }
++
++    wr32(ot.qup, QUP_MX_OUTPUT_COUNT, 0);
++    wr32(ot.qup, QUP_MX_INPUT_COUNT, 0);
++    wr32(ot.qup, QUP_MX_WRITE_COUNT, 7);
++    wr32(ot.qup, QUP_MX_READ_COUNT, 0);
++    /* Write-only transfer: NO_INPUT, as i2c-msm-v2 does (0x287). */
++    wr32(ot.qup, QUP_CONFIG, QUP_CONFIG_I2C | 0x80u);
++    wr32(ot.qup, QUP_IO_MODES,
++        (rd32(ot.qup, QUP_IO_MODES) & ~0x1fc00u) | 0xc000u);
++    wr32(ot.qup, QUP_OPERATIONAL_MASK, QUP_OP_SERVICE);
++
++    if (!qup_state(QUP_STATE_RUN)) {
++        return EBUSY;
++    }
++
++    wr32(ot.qup, QUP_I2C_CLK_CTL, QUP_CLK_400K);
++
++    if (!qup_state(QUP_STATE_PAUSE)) {
++        (void)qup_state(QUP_STATE_RESET);
++        return EBUSY;
++    }
++
++    const uint8_t out[7] = {
++        TAG_START, (uint8_t)(addr << 1),
++        TAG_WRITE_STOP, 3,
++        (uint8_t)(reg >> 8), (uint8_t)reg, value
++    };
++
++    for (unsigned i = 0; i < sizeof(out); i += 4) {
++        uint32_t word = 0;
++
++        for (unsigned j = 0; j < 4 && i + j < sizeof(out); ++j) {
++            word |= (uint32_t)out[i + j] << (8u * j);
++        }
++
++        wr32(ot.qup, QUP_OUT_FIFO, word);
++    }
++
++    if (!qup_state(QUP_STATE_RUN)) {
++        (void)qup_state(QUP_STATE_RESET);
++        return EBUSY;
++    }
++
++    int err = ETIMEDOUT;
++
++    for (unsigned i = 0; i < 10000; ++i) {
++        uint32_t st = rd32(ot.qup, QUP_I2C_STATUS);
++        uint32_t ef = rd32(ot.qup, QUP_ERROR_FLAGS);
++        uint32_t op = rd32(ot.qup, QUP_OPERATIONAL);
++
++        if ((st & QUP_I2C_ERRORS) || (ef & QUP_ERRORS)) {
++            ot.i2c_status = st;
++            ot.op = op;
++            err = (st & QUP_I2C_NACK) ? ENXIO : EIO;
++
++            wr32(ot.qup, QUP_I2C_STATUS, st & QUP_I2C_ERRORS);
++            wr32(ot.qup, QUP_ERROR_FLAGS, ef & QUP_ERRORS);
++            break;
++        }
++
++        if (op & QUP_OP_MAX_OUTPUT_DONE) {
++            wr32(ot.qup, QUP_OPERATIONAL, QUP_OP_SERVICE);
++            err = 0;
++            break;
++        }
++
++        delay(1);
++    }
++
++    if (err == ETIMEDOUT) {
++        ot.i2c_status = rd32(ot.qup, QUP_I2C_STATUS);
++        ot.op = rd32(ot.qup, QUP_OPERATIONAL);
++    }
++
++    (void)qup_state(QUP_STATE_RESET);
++    return err;
++}
++
 +static void
 +touch_map(int px, int py, int *sx, int *sy)
 +{
@@ -354,6 +567,80 @@ index 0000000..52ef3a8
 +		}
 +	}
 +	ot.active = mask;
++}
++
++static int
++goodix_poll(void)
++{
++    uint8_t status = 0;
++    uint8_t points[GT1X_MAX_REPORT];
++    int x[FTS_POINTS] = {0};
++    int y[FTS_POINTS] = {0};
++    uint32_t mask = 0;
++
++    int err = qup_read16(GT1X_ADDR, GT1X_REG_STATUS, &status, 1);
++    if (err) {
++        return err;
++    }
++
++    /* Bit 7 indicates a fresh coordinate report. */
++    if (!(status & GT1X_STATUS_READY)) {
++        return 0;
++    }
++
++    unsigned count = status & GT1X_STATUS_COUNT;
++
++    if (count > GT1X_MAX_POINTS) {
++        return EIO;
++    }
++    /* One FIFO-mode read holds in_fifo - 2 bytes (64-byte FIFO: 7 points). */
++    if (count * GT1X_POINT_SIZE > ot.in_fifo - 2u) {
++        count = (ot.in_fifo - 2u) / GT1X_POINT_SIZE;
++    }
++
++    if (count != 0) {
++        err = qup_read16(GT1X_ADDR, GT1X_REG_POINT,
++            points, count * GT1X_POINT_SIZE);
++
++        if (err) {
++            return err;
++        }
++
++        for (unsigned i = 0; i < count; ++i) {
++            const uint8_t *p = points + i * GT1X_POINT_SIZE;
++
++            /*
++             * GT1x point record:
++             * track ID, X low/high, Y low/high, width low/high,
++             * reserved byte.
++             */
++            unsigned id = p[0] & 0x0Fu;
++            int px = (int)p[1] | ((int)p[2] << 8);
++            int py = (int)p[3] | ((int)p[4] << 8);
++
++            if (id >= FTS_POINTS ||
++                px >= FTS_PANEL_W || py >= FTS_PANEL_H ||
++                (mask & (1u << id))) {
++                return EIO;
++            }
++
++            mask |= 1u << id;
++            x[id] = px;
++            y[id] = py;
++        }
++    }
++
++    /*
++     * The controller requires the status register to be cleared after
++     * consuming the report. Do not ignore a failed clear.
++     */
++    err = qup_write16(GT1X_ADDR, GT1X_REG_STATUS, 0);
++    if (err) {
++        return err;
++    }
++
++    touch_report(mask, x, y);
++    return 0;
 +}
 +
 +static int
@@ -434,6 +721,45 @@ index 0000000..52ef3a8
 +	touch_wait(20);
 +	touch_gpio(GPIO_RESET, 0, 3, 8, true, true);
 +	touch_wait(200);
++    /*
++     * Probe the alternate Goodix controller at 0x14.
++     * This runs after the shared QUP/GPIO setup and reset pulse.
++     */
++    uint8_t gt_status = 0;
++    int gt_err = qup_read16(GT1X_ADDR, GT1X_REG_STATUS,
++        &gt_status, 1);
++
++    printf("ONCLITE TOUCH: Goodix probe err=%d status=%#x\n",
++        gt_err, gt_status);
++
++    if (!gt_err) {
++        printf("ONCLITE TOUCH: GT1x detected at 0x14; polling Goodix reports\n");
++
++        unsigned errors = 0;
++
++        for (;;) {
++            int err = goodix_poll();
++
++            if (err) {
++                if ((errors++ % 100u) == 0) {
++                    printf("ONCLITE TOUCH: Goodix report err %d "
++                        "(I2C status %#x op %#x)\n",
++                        err, ot.i2c_status, ot.op);
++                }
++
++                if (errors == 10) {
++                    touch_report(0, ot.x, ot.y);
++                }
++            } else {
++                errors = 0;
++            }
++
++            touch_wait(10);
++        }
++    }
++
++    printf("ONCLITE TOUCH: Goodix not detected; trying FocalTech\n");
++
 +	uint8_t idh = 0, idl = 0;
 +	int e1 = EIO, e2 = EIO;
 +	for (unsigned i = 0; i < 50; ++i) {
