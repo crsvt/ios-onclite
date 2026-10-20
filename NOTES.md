@@ -271,6 +271,23 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   LaunchServices database was kept, so only the first boot pays the seed. Touch still dead (L10 off).
 - Committed, not built: timer restart calls reboot_kernel(RB_QUICK) to sync file systems before PS_HOLD.
 - Touch blocked on the RPM SMD request for L10 (recipe `.claude/research/rpm-l10-report.md`); not implemented yet.
+- **H5 (07:11, kernel 21, `logs/xnu-h5-keys.txt`): buttons work.** `ONCLITE KEYS: PON channel 40, GPIO 85 cfg 0x43`;
+  vol- (PON RESIN, 0xea), vol+ (GPIO85 low, 0xe9) and power (KPDPWR, 0x30) reach SweetHIDButtons; power locks
+  (AKS 26/27) -> `SWEET FB: display off`, next press -> `display on`. On the mostly black lock screen the fade is
+  hard to see. iOS also auto-locks/display-off after ~1 min idle.
+- **0112 onclite_rpm.c** (written by the user from the report, reviewed and fixed: ACK length = first SMD header
+  word, words[] bound, unused helper removed, tx.fTAIL=0 before copy, rx.fSTATE cleared on state change, no
+  <stdint.h>, info/FIFO may be in SMEM or msg RAM). Called from the touch thread before the reset pulse.
+- **Goodix GT1151Q** support in onclite_touch.c (user-written; reviewed against stock gt1x_generic.c: id p[0]&0xf,
+  x p1|p2<<8, y p3|p4<<8, status 0x814E bit7/count, clear by writing 0, no axis warp; fixes: NO_INPUT (0x287) for the
+  write-only transfer, point reads capped to the 64-byte FIFO = 7 points). Probed at 0x14 before FocalTech 0x38.
+- **H6/H6b (kernel 22): eMMC `CMD7 ... failed (60): status 0x2`** (busy end, no CMD_COMPLETE) twice -> no root.
+  Kernel 23 accepts XFER_COMPLETE for R1b without data and retries identification 3x.
+- **H6c (07:48, kernel 23, `logs/xnu-h6c-rpmdiag.txt`): boots; RPM Phase A matches the report:** SMEM v11,
+  rpm_requests cid 4 flags 0x20f refs 1, info aux 0x60000 off 0 size 88, FIFO aux 0x60000 off 0x800 size 2048 (2x1024),
+  tx CLOSED (head=tail=0xc0), rx CLOSING (head=tail=0x50). LK's requests in tx (len 0x4c: req/56/id/set0/ldoa 6/
+  swen 1/uv 1800000/ma 100) and RPM ACKs in rx (len 0x14: req/12/msg#/4/id). Goodix 0x14 NACK, FT5446 0x38 NACK.
+  -> writes enabled (0b43de9) for H7.
 - **0108 touch (`bsd/dev/onclite_touch.c`, CI 39332051381):** FT5446 @0x38 on BLSP1 QUP3 0x78b7000, polled FIFO
   transfers with V2 tags, GCC BLSP1 AHB vote + QUP3 RCG XO/1 + CBCR, GPIO10/11 func 2, reset GPIO64, chip ID
   0xA3/0x9F, report reg 0x00 every 10 ms, panel 720x1520 -> canvas -> sweet 1080x2400 coordinates for
