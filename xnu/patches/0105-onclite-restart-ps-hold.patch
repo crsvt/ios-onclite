@@ -1,11 +1,13 @@
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..26584fa 100644
+index 0631685..c4de0fb 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -10,6 +10,262 @@
+@@ -9,6 +9,322 @@
+ #include <IOKit/IOPlatformExpert.h>
  #include <IOKit/IODeviceTreeSupport.h>
  #include <IOKit/IOLib.h>
- 
++#include <IOKit/IOUserClient.h>
++
 +#if defined(ONCLITE)
 +#include <machine/atomic.h>
 +#include <kern/thread.h>
@@ -260,12 +262,70 @@ index 0631685..26584fa 100644
 +	reboot_kernel(ONCLITE_RB_QUICK, NULL);
 +	PEHaltRestart(kPERestartCPU);
 +}
-+#endif /* ONCLITE */
 +
++/*
++ * Stand-in for IONetworkingFamily's IONetworkStack. configd's InterfaceNamer
++ * opens it to name network interfaces and posts "IOKit quiet" only once it
++ * has; without it SCNetworkInterfaceCopyAll() (Settings > About's MAC
++ * address, Wi-Fi settings) waits for InterfaceNamer's 300 s WaitStackTimeout
++ * (H9 live log). There are no IONetworkInterface objects here, so the user
++ * client only has to open and accept (and log) naming commands.
++ */
++class IONetworkStack : public IOService {
++	OSDeclareDefaultStructors(IONetworkStack);
++};
++
++OSDefineMetaClassAndStructors(IONetworkStack, IOService);
++
++class IONetworkStackUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(IONetworkStackUserClient);
++
++public:
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient);
++
++IOReturn
++IONetworkStackUserClient::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	OSNumber *cmd = dict ? OSDynamicCast(OSNumber, dict->getObject("IONetworkStackUserCommand")) : NULL;
++	IOLog("ONCLITE: IONetworkStack command %d (no IONetworkInterface here)\n",
++	    cmd ? (int)cmd->unsigned32BitValue() : -1);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IONetworkStackUserClient::clientClose(void)
++{
++	if (!isInactive()) {
++		terminate();
++	}
++	return kIOReturnSuccess;
++}
++
++static void
++onclite_network_stack_publish(IOService *provider)
++{
++	IONetworkStack *stack = OSTypeAlloc(IONetworkStack);
++	if (stack == NULL || !stack->init()) {
++		OSSafeReleaseNULL(stack);
++		return;
++	}
++	stack->setProperty("IOUserClientClass", "IONetworkStackUserClient");
++	if (stack->attach(provider)) {
++		stack->registerService();
++		IOLog("ONCLITE: IONetworkStack stand-in registered\n");
++	}
++	stack->release();
++}
++#endif /* ONCLITE */
+ 
  class SweetPlatformExpert : public IODTPlatformExpert {
  	OSDeclareDefaultStructors(SweetPlatformExpert);
- 
-@@ -31,6 +287,31 @@ SweetPlatformExpert::start(IOService *provider)
+@@ -31,6 +347,32 @@ SweetPlatformExpert::start(IOService *provider)
  	}
  	registerService();
  	IOLog("SWEET: platform expert registered\n");
@@ -293,6 +353,7 @@ index 0631685..26584fa 100644
 +	}
 +	IOLog("ONCLITE: restart via PS_HOLD %s, reboot timer %u s\n",
 +	    onclite_pshold != NULL ? "ready" : "UNAVAILABLE", secs);
++	onclite_network_stack_publish(this);
 +#endif
  	return true;
  }
