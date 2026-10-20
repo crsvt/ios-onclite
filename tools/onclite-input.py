@@ -5,6 +5,7 @@
   tools/onclite-input.py swipe X0 Y0 X1 Y1 [MS]
   tools/onclite-input.py home                    (swipe up from the bottom edge)
   tools/onclite-input.py key power|up|down [press|down|up]
+  tools/onclite-input.py reboot fastboot|recovery|normal
 
 Coordinates are iOS canvas pixels (1125x2436, the screenshot size). Needs a
 kernel with the remote input responder (sweet_usb.c, UDP 192.168.7.2:5141).
@@ -41,6 +42,9 @@ def main(argv):
                 import time
                 time.sleep(0.15)
             send(b'KEY ' + struct.pack('<II', k, 0))
+    elif cmd == 'reboot' and args and args[0] in ('normal', 'recovery', 'fastboot'):
+        mode = {'normal': 0, 'recovery': 1, 'fastboot': 2}[args[0]]
+        send(b'BOOT' + b'CNIO' + struct.pack('<I', mode))
     else:
         sys.exit(__doc__)
 

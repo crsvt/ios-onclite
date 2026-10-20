@@ -1,8 +1,8 @@
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..01d32aa 100644
+index 0631685..4ce27e9 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -9,6 +9,465 @@
+@@ -9,6 +9,483 @@
  #include <IOKit/IOPlatformExpert.h>
  #include <IOKit/IODeviceTreeSupport.h>
  #include <IOKit/IOLib.h>
@@ -54,12 +54,30 @@ index 0631685..01d32aa 100644
 +
 +extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern "C" kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
-+extern "C" int reboot_kernel(int howto, char *message);  /* bsd/kern/kern_shutdown.c */
++/* reboot_kernel (bsd/kern/kern_shutdown.c) is declared with onclite_remote_restart() */
 +#define ONCLITE_RB_QUICK        0x400   /* bsd/sys/reboot.h RB_QUICK */
 +
 +static volatile uint32_t *onclite_pshold;
 +static vm_offset_t onclite_spmi_chnl, onclite_spmi_obsrvr;     /* the PON channel's windows */
 +static uint32_t onclite_reset_mode = LK_MODE_RECOVERY;
++
++/*
++ * Remote restart (bsd/dev/sweet_usb.c "BOOT" command): 0 normal, 1 recovery
++ * (TWRP), 2 fastboot. File system caches are flushed first (RB_QUICK).
++ */
++extern "C" int reboot_kernel(int howto, char *message);
++extern "C" void onclite_remote_restart(uint32_t mode);
++void
++onclite_remote_restart(uint32_t mode)
++{
++	if (mode > LK_MODE_FASTBOOT) {
++		return;
++	}
++	onclite_reset_mode = mode;
++	IOLog("ONCLITE: remote restart to LK mode %u\n", mode);
++	reboot_kernel(0x400 /* RB_QUICK */, NULL);
++	PEHaltRestart(kPERestartCPU);
++}
 +
 +static int
 +onclite_spmi_wait(vm_offset_t window)
@@ -468,7 +486,7 @@ index 0631685..01d32aa 100644
  
  class SweetPlatformExpert : public IODTPlatformExpert {
  	OSDeclareDefaultStructors(SweetPlatformExpert);
-@@ -31,6 +490,37 @@ SweetPlatformExpert::start(IOService *provider)
+@@ -31,6 +508,37 @@ SweetPlatformExpert::start(IOService *provider)
  	}
  	registerService();
  	IOLog("SWEET: platform expert registered\n");
