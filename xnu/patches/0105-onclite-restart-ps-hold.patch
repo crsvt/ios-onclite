@@ -1,8 +1,8 @@
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..9a59d7e 100644
+index 0631685..ef30c8a 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -10,6 +10,250 @@
+@@ -10,6 +10,258 @@
  #include <IOKit/IODeviceTreeSupport.h>
  #include <IOKit/IOLib.h>
  
@@ -52,6 +52,8 @@ index 0631685..9a59d7e 100644
 +
 +extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern "C" kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern "C" int reboot_kernel(int howto, char *message);  /* bsd/kern/kern_shutdown.c */
++#define ONCLITE_RB_QUICK        0x400   /* bsd/sys/reboot.h RB_QUICK */
 +
 +static volatile uint32_t *onclite_pshold;
 +static vm_offset_t onclite_spmi_chnl, onclite_spmi_obsrvr;     /* the PON channel's windows */
@@ -246,6 +248,12 @@ index 0631685..9a59d7e 100644
 +		left -= step;
 +	}
 +	IOLog("ONCLITE: onclite_reboot_after=%u expired, restarting\n", secs);
++	/*
++	 * Flush the file system caches first (RB_QUICK: sync, no process
++	 * shutdown), so what iOS saved last (e.g. the LaunchServices database)
++	 * is on the eMMC before the PS_HOLD reset.
++	 */
++	reboot_kernel(ONCLITE_RB_QUICK, NULL);
 +	PEHaltRestart(kPERestartCPU);
 +}
 +#endif /* ONCLITE */
@@ -253,7 +261,7 @@ index 0631685..9a59d7e 100644
  class SweetPlatformExpert : public IODTPlatformExpert {
  	OSDeclareDefaultStructors(SweetPlatformExpert);
  
-@@ -31,6 +275,31 @@ SweetPlatformExpert::start(IOService *provider)
+@@ -31,6 +283,31 @@ SweetPlatformExpert::start(IOService *provider)
  	}
  	registerService();
  	IOLog("SWEET: platform expert registered\n");

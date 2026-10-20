@@ -1,22 +1,23 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 6630131..02a6172 100644
+index 6630131..d430bb9 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -105,6 +105,8 @@ bsd/dev/random/randomdev.c		standard
+@@ -105,6 +105,9 @@ bsd/dev/random/randomdev.c		standard
  
  bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
 +bsd/dev/onclite_emmc.c			standard
 +bsd/dev/onclite_touch.c			standard
++bsd/dev/onclite_keys.c			standard
  bsd/dev/sweet_sample.c			standard
  bsd/dev/sweet_keys.c			standard
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/onclite_emmc.c b/bsd/dev/onclite_emmc.c
 new file mode 100644
-index 0000000..e02f42f
+index 0000000..07a89c2
 --- /dev/null
 +++ b/bsd/dev/onclite_emmc.c
-@@ -0,0 +1,1193 @@
+@@ -0,0 +1,1196 @@
 +/*
 + * onclite internal eMMC root device.
 + *
@@ -80,6 +81,8 @@ index 0000000..e02f42f
 +extern void sweet_sample_start(void);
 +/* bsd/dev/onclite_touch.c: FT5446 touch (boot-arg onclitetouch) */
 +extern void onclite_touch_init(void);
++/* bsd/dev/onclite_keys.c: power / volume buttons (boot-arg onclitekeys) */
++extern void onclite_keys_init(void);
 +/* bsd/dev/sweet_usb.c: DWC3 CDC-ECM + live console log (boot-arg sweetusb, default 0 on onclite) */
 +extern void sweet_usb_probe(void);
 +
@@ -1190,6 +1193,7 @@ index 0000000..e02f42f
 +	/* sweet_ufs.c starts its sampler with the root too. */
 +	sweet_sample_start();
 +	onclite_touch_init();
++	onclite_keys_init();
 +	/* As sweet_ufs.c: USB probe (sweetusb=1) / ue0 + live log (sweetusb=2). */
 +	sweet_usb_probe();
 +	return 0;
