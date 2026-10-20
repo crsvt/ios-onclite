@@ -299,6 +299,13 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   L3/L7/L13 in the PMIC report; USB power-up port (sweetusb=2, experimental, not enabled in H8); ADT /chosen
   mac-address-wifi0/bluetooth0 (cherry-picked from ry-diffusion/ios-beryllium ae85413, author kept: 68336b3).
   H8 boot-args: sweetfb_hz=20, onclite_reboot_after=1800.
+- H8 (08:33, kernel 25, sweetfb_hz=20): user: About still does not open (Settings then won't reopen), swiping
+  very laggy. H8 log lost: from fastboot `fastboot reboot recovery` booted the boot partition this time (not TWRP).
+- **🎉 H9 (08:40, kernel 25 + sweetusb=2): USB LIVE LOG ON A NORMAL BOOT.** The LK-port power-up (GDSC, USB30
+  clocks, QUSB2) brought the DWC3 up; the Mac saw the CDC-ECM interface en6 40 s after boot. Host setup without a
+  terminal for sudo: `! osascript -e 'do shell script "ifconfig en6 inet 192.168.7.1 netmask 255.255.255.0 alias up"
+  with administrator privileges'`, receiver `tools/onclite-usbnet-mac.sh logs/live-NAME.txt`. The stream starts with
+  the last 64 KiB (early boot lines are only in ramoops).
 - Open: PosterBoard first-time setup trap (wallpaper), About page (MobileGestalt, maybe fixed by the MACs), AppOS apps
   not installed (installcoordinationd?), CPU above 800 MHz needs the S5 reading, iOS 16 lag (CPU rendering).
 - **0108 touch (`bsd/dev/onclite_touch.c`, CI 39332051381):** FT5446 @0x38 on BLSP1 QUP3 0x78b7000, polled FIFO
