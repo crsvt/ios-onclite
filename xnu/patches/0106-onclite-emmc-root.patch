@@ -13,10 +13,10 @@ index 6630131..02a6172 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/onclite_emmc.c b/bsd/dev/onclite_emmc.c
 new file mode 100644
-index 0000000..e28cef7
+index 0000000..e02f42f
 --- /dev/null
 +++ b/bsd/dev/onclite_emmc.c
-@@ -0,0 +1,1177 @@
+@@ -0,0 +1,1193 @@
 +/*
 + * onclite internal eMMC root device.
 + *
@@ -259,6 +259,7 @@ index 0000000..e28cef7
 +	int bmajor, cmajor;
 +	dev_t bdev;
 +	bool ready;
++	uint32_t card_khz;                      /* current card clock (emmc_set_clock) */
 +} se;
 +
 +static LCK_GRP_DECLARE(onclite_emmc_grp, "onclite_emmc");
@@ -402,8 +403,21 @@ index 0000000..e28cef7
 +			mode |= TM_MULTI | TM_AUTO_CMD12;
 +		}
 +	}
++	/*
++	 * At the ~400 kHz identification clock the host loses back-to-back
++	 * command writes: H2 (Gold at 800 MHz instead of 19.2 MHz) issued CMD6
++	 * right after CMD7's busy end and it never completed (no interrupt in
++	 * 5 s). Give the slow card clock a few dozen cycles between writes.
++	 */
++	unsigned gap_us = (se.card_khz != 0 && se.card_khz < 1000) ? 100 : 0;
++	if (gap_us) {
++		delay(gap_us);
++	}
 +	wr32(SDHCI_ARGUMENT, arg);
 +	wr16(SDHCI_TRANSFER_MODE, mode);
++	if (gap_us) {
++		delay(gap_us);
++	}
 +	wr16(SDHCI_COMMAND, (uint16_t)((index << 8) | resp_flags | (count ? CMD_DATA : 0)));
 +
 +	int error = emmc_wait(INT_CMD_COMPLETE, &status);
@@ -584,6 +598,7 @@ index 0000000..e28cef7
 +	}
 +	wr16(SDHCI_CLOCK_CONTROL, (uint16_t)(clk | CLK_SD_EN));
 +	delay(1000);
++	se.card_khz = n ? base_khz / (2 * n) : base_khz;
 +	printf("ONCLITE EMMC: card clock ~%u kHz (divider %u, clock 0x%x)\n",
 +	    n ? base_khz / (2 * n) : base_khz, n, rd16(SDHCI_CLOCK_CONTROL));
 +	return 0;
@@ -652,6 +667,7 @@ index 0000000..e28cef7
 +	    (error = emmc_cmd(MMC_SELECT_CARD, arg, CMD_R1B, 0, false, &r))) {
 +		return error;
 +	}
++	delay(2000);    /* let the card settle in transfer state before CMD6 */
 +	if ((error = emmc_switch(EXT_CSD_BUS_WIDTH, EXT_CSD_BUS_WIDTH_8))) {
 +		return error;
 +	}
