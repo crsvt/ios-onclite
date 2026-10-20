@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index a62416c..42144a9 100644
+index a62416c..83b4660 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -25,10 +25,18 @@
@@ -46,7 +46,16 @@ index a62416c..42144a9 100644
  
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
-@@ -114,8 +139,20 @@ public:
+@@ -82,6 +107,8 @@ enum {
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
++#define ONC_DSI0_PA                     0x01a94000UL    /* live DT mdss_dsi_ctrl0 dsi_ctrl */
++
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+ };
+@@ -114,8 +141,26 @@ public:
  	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
  	bool          fDirty;
  	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
@@ -57,17 +66,23 @@ index a62416c..42144a9 100644
 +	/* The real panel: LK's RGB888 splash, scaled into from the shadow canvas. */
 +	uintptr_t     fPanel;
 +	uint64_t      fPanelPhys;
++	vm_offset_t   fDsi;           /* DSI0 controller (backlight by DCS), 0 if absent */
++	vm_offset_t   fDsiBuf;        /* uncached command packet in the shadow region's tail */
++	uint64_t      fDsiBufPhys;
++	uint8_t       fBlLevel;       /* DCS 0x51 brightness restored on display on */
 +	uint32_t      fPanelW, fPanelH, fPanelStride;
 +	uint32_t      fOutW, fOutH, fOutX, fOutY;      /* scaled canvas inside the panel */
 +	uint8_t       fByteComp[3];   /* per byte: 0 = G, 1 = B, 2 = R (MDP5 unpack) */
 +	uint32_t     *fMapX, *fMapY;  /* panel pixel -> canvas pixel */
 +	bool panelSetup(void);
 +	void panelCopy(void);
++	bool dsiSend(uint8_t dtype, uint8_t cmd, uint8_t param);
++	void panelPower(bool on);
 +#endif
  
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
  	void addClient(IOMobileFramebufferUserClient *client);
-@@ -126,6 +163,122 @@ public:
+@@ -126,6 +171,203 @@ public:
  
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
  
@@ -94,6 +109,25 @@ index a62416c..42144a9 100644
 +	if ((uint64_t)fRowBytes * fHeight > reg[1]) {
 +		IOLog("ONCLITE FB: shadow region 0x%llx too small\n", reg[1]);
 +		return false;
++	}
++	/*
++	 * The BOE HX8394F backlight is set by DCS (DT bl_ctrl_dcs, max 0xff): an
++	 * LCD keeps its backlight on behind black pixels. Commands go out through
++	 * DSI0's command DMA (Linux mdss_dsi_host.c offsets; as ios-topaz 0104/0106
++	 * did on SM6225). The packet sits in the last page of our shadow region,
++	 * mapped uncached (clean_dcache is a no-op in this config, ios-topaz 0111).
++	 */
++	if ((uint64_t)fRowBytes * fHeight + PAGE_SIZE <= reg[1]) {
++		fDsiBufPhys = reg[0] + reg[1] - PAGE_SIZE;
++		fDsiBuf = ml_io_map((vm_offset_t)fDsiBufPhys, PAGE_SIZE);
++		fDsi = ml_io_map(ONC_DSI0_PA, PAGE_SIZE);
++		uint32_t bl = 0xc8;
++		PE_parse_boot_argn("onclite_bl", &bl, sizeof(bl));
++		fBlLevel = (uint8_t)(bl > 0xff ? 0xff : (bl == 0 ? 1 : bl));
++		if (fDsi != 0) {
++			IOLog("ONCLITE FB: DSI0 ctrl 0x%x, backlight by DCS 0x51 (on level 0x%x)\n",
++			    *(volatile uint32_t *)(fDsi + 0x004), fBlLevel);
++		}
 +	}
 +
 +	/* LK's splash pipe: address in the splash region, RGB888. Defaults: probe. */
@@ -185,12 +219,74 @@ index a62416c..42144a9 100644
 +		}
 +	}
 +}
++
++static inline uint32_t onc_dsi_rd(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
++static inline void
++onc_dsi_wr(vm_offset_t b, uint32_t o, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(b + o) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* One DCS short write (dtype 0x05: no parameter, 0x15: one) by command DMA. */
++bool
++AppleCLCD::dsiSend(uint8_t dtype, uint8_t cmd, uint8_t param)
++{
++	if (fDsi == 0 || fDsiBuf == 0) {
++		return false;
++	}
++	/* header: data0, data1, data type, flags (0x80: last command) */
++	*(volatile uint32_t *)fDsiBuf = (uint32_t)cmd | ((uint32_t)param << 8) |
++	    ((uint32_t)dtype << 16) | (0x80u << 24);
++	uint32_t ctrl = onc_dsi_rd(fDsi, 0x004), trig = onc_dsi_rd(fDsi, 0x084);
++	if ((trig & 7) != 4) {
++		onc_dsi_wr(fDsi, 0x084, (trig & ~7u) | 4);      /* DMA trigger: software */
++	}
++	onc_dsi_wr(fDsi, 0x004, ctrl | 4 | 1);                  /* CMD_MODE_EN | DSI_EN */
++	onc_dsi_wr(fDsi, 0x110, onc_dsi_rd(fDsi, 0x110) | 1);   /* clear CMD_DMA_DONE */
++	onc_dsi_wr(fDsi, 0x048, (uint32_t)fDsiBufPhys);
++	onc_dsi_wr(fDsi, 0x04c, 4);
++	uint32_t dma = onc_dsi_rd(fDsi, 0x03c);
++	onc_dsi_wr(fDsi, 0x03c, dma & ~(1u << 26));             /* high speed */
++	onc_dsi_wr(fDsi, 0x090, 1);                             /* SW trigger */
++	bool done = false;
++	for (int i = 0; i < 50 && !done; i++) {
++		done = (onc_dsi_rd(fDsi, 0x110) & 1) != 0;
++		if (!done) {
++			IODelay(1000);
++		}
++	}
++	onc_dsi_wr(fDsi, 0x110, onc_dsi_rd(fDsi, 0x110) | 1);
++	onc_dsi_wr(fDsi, 0x03c, dma);
++	onc_dsi_wr(fDsi, 0x004, ctrl);
++	if (trig != onc_dsi_rd(fDsi, 0x084)) {
++		onc_dsi_wr(fDsi, 0x084, trig);
++	}
++	return done;
++}
++
++/* Display off: brightness 0 and DCS 0x28; on: 0x29 and the saved brightness. */
++void
++AppleCLCD::panelPower(bool on)
++{
++	bool a, b;
++	if (on) {
++		a = dsiSend(0x05, 0x29, 0);
++		b = dsiSend(0x15, 0x51, fBlLevel);
++	} else {
++		a = dsiSend(0x15, 0x51, 0);
++		b = dsiSend(0x05, 0x28, 0);
++	}
++	IOLog("ONCLITE FB: panel %s by DCS: %s/%s\n", on ? "on" : "off",
++	    a ? "done" : "NO DONE", b ? "done" : "NO DONE");
++}
 +#endif /* ONCLITE */
 +
  class IOMobileFramebufferUserClient : public IOUserClient {
  	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
  
-@@ -157,11 +310,18 @@ AppleCLCD::start(IOService *provider)
+@@ -157,11 +399,18 @@ AppleCLCD::start(IOService *provider)
  	if (!IOService::start(provider)) {
  		return false;
  	}
@@ -209,7 +305,7 @@ index a62416c..42144a9 100644
  	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
  		IOLog("SWEET FB: no boot framebuffer\n");
  		return false;
-@@ -194,15 +354,30 @@ AppleCLCD::start(IOService *provider)
+@@ -194,15 +443,30 @@ AppleCLCD::start(IOService *provider)
  	}
  	uint32_t hz = 10;
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
@@ -244,7 +340,7 @@ index a62416c..42144a9 100644
  	return true;
  }
  
-@@ -225,6 +400,27 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -225,6 +489,27 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
  	}
  	if (fb->fPowerOff) {
@@ -272,7 +368,7 @@ index a62416c..42144a9 100644
  		/* Fade out: halve every channel each vsync, then black, then idle. */
  		uint32_t step = fb->fFadeStep;
  		if (step <= 6) {
-@@ -238,8 +434,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -238,8 +523,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
  				}
  			}
@@ -285,7 +381,7 @@ index a62416c..42144a9 100644
  		return;
  	}
  	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
-@@ -255,8 +454,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -255,8 +543,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	if (rec != NULL) {
  		fb->present(rec);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
@@ -298,3 +394,13 @@ index a62416c..42144a9 100644
  }
  
  void
+@@ -543,6 +834,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
++#if defined(ONCLITE)
++			fFB->panelPower(!off);
++#endif
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
