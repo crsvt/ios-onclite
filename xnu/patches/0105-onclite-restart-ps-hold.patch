@@ -1,8 +1,8 @@
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..ef30c8a 100644
+index 0631685..1e49e07 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -10,6 +10,258 @@
+@@ -10,6 +10,260 @@
  #include <IOKit/IODeviceTreeSupport.h>
  #include <IOKit/IOLib.h>
  
@@ -152,8 +152,8 @@ index 0631685..ef30c8a 100644
 +}
 +
 +/*
-+ * Touch power check (read-only): print the state of PM8953 L6 (1.8 V, touch
-+ * I/O and panel) and L10 (2.8 V, touch VDD), peripherals 0x45/0x49 on SID 1
++ * Power check (read-only): print the state of PM8953 L6 (1.8 V, touch
++ * I/O and panel), L10 (2.8 V, touch VDD) and the USB PHY's L3/L7/L13, peripherals 0x45/0x49 on SID 1
 + * (LDOn at 0x4000 + (n - 1) * 0x100). Observer reads work for channels owned
 + * by any EE. STATUS1 0x08 bit 7 = VREG_READY, VSET 0x40/0x41, EN_CTL 0x46 bit 7.
 + */
@@ -162,6 +162,8 @@ index 0631685..ef30c8a 100644
 +{
 +	static const struct { const char *name; uint32_t ppid; } ldos[] = {
 +		{ "L6", 0x145 }, { "L10", 0x149 },
++		/* USB QUSB2 PHY supplies (DT vdd / vdda18 / vdda33) */
++		{ "L3", 0x143 }, { "L7", 0x147 }, { "L13", 0x14d },
 +	};
 +	vm_offset_t core = ml_io_map(SPMI_CORE_PA, 0x1000);
 +	vm_offset_t cnfg = ml_io_map(SPMI_CNFG_PA, 0x1000);
@@ -261,7 +263,7 @@ index 0631685..ef30c8a 100644
  class SweetPlatformExpert : public IODTPlatformExpert {
  	OSDeclareDefaultStructors(SweetPlatformExpert);
  
-@@ -31,6 +283,31 @@ SweetPlatformExpert::start(IOService *provider)
+@@ -31,6 +285,31 @@ SweetPlatformExpert::start(IOService *provider)
  	}
  	registerService();
  	IOLog("SWEET: platform expert registered\n");

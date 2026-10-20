@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
-index b6c1a41..ca6abae 100644
+index b6c1a41..59a96fe 100644
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
 @@ -9,8 +9,19 @@
@@ -95,7 +95,334 @@ index b6c1a41..ca6abae 100644
  
  static uint32_t
  usb_rd(vm_offset_t base, uint32_t off)
-@@ -76,62 +136,87 @@ usb_rd(vm_offset_t base, uint32_t off)
+@@ -73,65 +133,435 @@ usb_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
++#if defined(ONCLITE)
++/*
++ * Normal boot (no fastboot): LK never ran its USB code, so the USB30 GDSC and
++ * all USB clocks are off (H1). Bring the block up the way LK does before
++ * fastboot (lk2nd msm8953: acpuclock.c clock_usb30_init, msm8953-clock.c
++ * tables, usb30_udc.c usb30_init, qusb2_phy.c qusb2_phy_reset,
++ * usb30_wrapper.c, usb30_dwc*.c), USB 2.0 only (micro-USB; the QMP SS PHY
++ * is not initialised; LK's HS-only fallback is used instead). Only with
++ * sweetusb>=2. Every poll is bounded; DWC3/QSCRATCH are touched only after
++ * the GDSC, master and iface clocks report on, QUSB2/AHB2PHY only after
++ * phy-cfg-ahb reports on. Returns 0 when the controller is ready for
++ * sweet_usb_gadget_start (device mode, PHY up, core out of reset).
++ */
++#define OU_TAG                  UD_TAG "power-up: "
++#define GCC_APCS_GPLL_ENA_VOTE  0x45000         /* bit 0 GPLL0, bit 7 GPLL6 (LK pll_vote_clk) */
++#define GCC_GPLL0_MODE          0x21000         /* bit 30 active (LK gpll0_clk_src.status_mask) */
++#define GCC_GPLL6_STATUS        0x37024         /* bit 17 active (LK gpll6_clk_src.status_mask) */
++#define GCC_USB3_PHY_BCR        0x3f034         /* LK usb30_phy_reset */
++#define GCC_USB3PHY_PHY_BCR     0x3f03c         /* LK usb30_pipe_clk bcr */
++#define GCC_QUSB2_PHY_BCR       0x4103c         /* LK qusb2_phy_reset */
++#define GCC_USB30_MASTER_CMD    0x3f00c         /* CMD_RCGR, CFG +4, M +8, N +0xc, D +0x10 */
++#define GCC_USB30_MOCK_UTMI_CMD 0x3f020         /* CMD_RCGR, CFG +4 (LK: hid, no M/N) */
++#define GCC_USB3_AUX_CMD        0x3f05c         /* CMD_RCGR, CFG +4, M +8, N +0xc, D +0x10 */
++#define RCG_CMD_UPDATE          (1u << 0)
++#define RCG_CMD_ROOT_OFF        (1u << 31)
++#define GDSC_SW_COLLAPSE        (1u << 0)
++#define CBCR_CLK_ENABLE         (1u << 0)
++#define AHB2PHY_PA              0x0007e000      /* LK AHB2_PHY_BASE; TOP_CFG at +0x10 */
++#define TCSR_PHY_CLK_SCHEME_PA  0x0193f000      /* LK TCSR_PHY_CLK_SCHEME_SEL = +0x44, bit 0 */
++/* QUSB2 v1 offsets (LK qusb2_phy.h / Linux phy-msm-qusb.c, matching the DT init-seq) */
++#define QUSB2_PLL_TEST          0x04
++#define QUSB2_PLL_TUNE          0x08
++#define QUSB2_PLL_USER_CTL1     0x0c
++#define QUSB2_PLL_USER_CTL2     0x10
++#define QUSB2_PLL_PWR_CTL       0x18
++#define QUSB2_PLL_AUTOPGM_CTL1  0x1c
++#define QUSB2_PLL_STATUS        0x38
++#define   QUSB2_PLL_LOCK        (1u << 5)
++#define QUSB2_PORT_TUNE1        0x80
++#define QUSB2_PORT_TUNE2        0x84
++#define QUSB2_PORT_TUNE3        0x88
++#define QUSB2_PORT_TUNE4        0x8c
++#define QUSB2_PORT_TEST2        0x9c
++#define QUSB2_PORT_POWERDOWN    0xb4
++/* QSCRATCH (LK usb30_wrapper_hwio.h) */
++#define QS_GENERAL_CFG          0x08
++#define   QS_DBM_EN             (1u << 1)
++#define   QS_PIPE_UTMI_CLK_SEL  (1u << 0)
++#define   QS_PIPE3_PHYSTATUS_SW (1u << 3)
++#define   QS_PIPE_UTMI_CLK_DIS  (1u << 8)
++#define QS_RAM1_REG             0x0c
++#define QS_PARAMETER_OVERRIDE_X 0x14
++#define QS_SS_PHY_PARAM_CTRL_1  0x34
++#define   QS_HS_COMMONONN       (1u << 11)      /* HS_PHY_CTRL */
++#define   QS_HS_FREECLK_SEL     (1u << 25)      /* HS_PHY_CTRL */
++/* DWC3 globals (Linux dwc3/core.h) */
++#define OU_GCTL                 0xc110
++#define   OU_GCTL_DSBLCLKGTNG   (1u << 0)
++#define   OU_GCTL_FRMSCLDWN     (3u << 4)
++#define   OU_GCTL_DEBUGATTACH   (1u << 8)
++#define   OU_GCTL_CORESOFTRESET (1u << 11)
++#define   OU_GCTL_PRTCAPDIR     (3u << 12)
++#define   OU_GCTL_U2RSTECN      (1u << 16)
++#define   OU_GCTL_PWRDNSCALE    (0x1fffu << 19)
++#define OU_GUSB2PHYCFG          0xc200
++#define   OU_U2_SUSPHY          (1u << 6)
++#define   OU_U2_ENBLSLPM        (1u << 8)
++#define   OU_U2_PHYSOFTRST      (1u << 31)
++#define OU_GUSB3PIPECTL         0xc2c0
++#define   OU_U3_SUSPHY          (1u << 17)
++#define   OU_U3_DELAYP1TRANS    (1u << 18)
++#define   OU_U3_PHYSOFTRST      (1u << 31)
++
++static bool onclite_usb_powered;        /* set once onclite_usb_power_up succeeded */
++
++static inline void
++ou_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* Poll until (reg & mask) == want, at most max_us microseconds (1 us steps). */
++static bool
++ou_poll(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t want, unsigned max_us, unsigned *took)
++{
++	unsigned i;
++	for (i = 0; i <= max_us; i++) {
++		if ((usb_rd(base, off) & mask) == want) {
++			if (took) {
++				*took = i;
++			}
++			return true;
++		}
++		delay(1);
++	}
++	if (took) {
++		*took = i;
++	}
++	return false;
++}
++
++/* LK pll_vote_clk enable: set the APCS vote bit, poll the PLL status bit. */
++static bool
++ou_pll_vote(vm_offset_t gcc, const char *name, uint32_t vote_bit, uint32_t st_off, uint32_t st_bit)
++{
++	unsigned us;
++	uint32_t before = usb_rd(gcc, st_off);
++	if (!(usb_rd(gcc, GCC_APCS_GPLL_ENA_VOTE) & vote_bit)) {
++		ou_wr(gcc, GCC_APCS_GPLL_ENA_VOTE, usb_rd(gcc, GCC_APCS_GPLL_ENA_VOTE) | vote_bit);
++	}
++	bool ok = ou_poll(gcc, st_off, st_bit, st_bit, 500, &us);
++	printf(OU_TAG "%s status 0x%08x -> 0x%08x (vote 0x%08x) %s after %u us\n", name, before,
++	    usb_rd(gcc, st_off), usb_rd(gcc, GCC_APCS_GPLL_ENA_VOTE), ok ? "active" : "NOT ACTIVE", us);
++	return ok;
++}
++
++/*
++ * LK clock_lib2_rcg_set_rate_mnd / _hid: optional M/N/D, CFG source (10:8) and
++ * divider (4:0), MND mode (13:12) = 2 when N != 0 (mnd only), CMD UPDATE and poll.
++ */
++static bool
++ou_rcg(vm_offset_t gcc, const char *name, uint32_t cmd, uint32_t div_src, bool mnd,
++    uint32_t m, uint32_t n, uint32_t d)
++{
++	unsigned us;
++	uint32_t cfg_before = usb_rd(gcc, cmd + 4), cfg;
++	if (mnd) {
++		ou_wr(gcc, cmd + 0x8, m);
++		ou_wr(gcc, cmd + 0xc, n);
++		ou_wr(gcc, cmd + 0x10, d);
++		cfg = cfg_before & ~(0x1fu | (7u << 8) | (3u << 12));
++		cfg |= div_src;
++		if (n != 0) {
++			cfg |= 2u << 12;
++		}
++	} else {
++		cfg = (cfg_before & ~(0x1fu | (7u << 8))) | div_src;
++	}
++	ou_wr(gcc, cmd + 4, cfg);
++	ou_wr(gcc, cmd, usb_rd(gcc, cmd) | RCG_CMD_UPDATE);
++	bool ok = ou_poll(gcc, cmd, RCG_CMD_UPDATE, 0, 500, &us);
++	printf(OU_TAG "rcg %-9s CFG 0x%08x -> 0x%08x CMD 0x%08x%s%s\n", name, cfg_before,
++	    usb_rd(gcc, cmd + 4), usb_rd(gcc, cmd), mnd ? " (M/N/D set)" : "",
++	    ok ? "" : " UPDATE STUCK");
++	(void)us;
++	return ok;
++}
++
++/* LK clock_lib2_branch_clk_enable: CBCR bit 0, then wait for CLK_OFF (bit 31) to clear. */
++static bool
++ou_branch(vm_offset_t gcc, unsigned idx, bool check)
++{
++	unsigned us;
++	uint32_t off = usb_cbcr[idx].off, before = usb_rd(gcc, off);
++	ou_wr(gcc, off, before | CBCR_CLK_ENABLE);
++	bool ok = ou_poll(gcc, off, CBCR_CLK_OFF, 0, 500, &us);
++	printf(OU_TAG "clk %-12s CBCR 0x%08x -> 0x%08x %s after %u us%s\n", usb_cbcr[idx].name, before,
++	    usb_rd(gcc, off), ok ? "on" : "STILL OFF", us,
++	    (!ok && !check) ? " (expected: no halt check, as LK)" : "");
++	return ok || !check;
++}
++
++static void
++ou_bcr_pulse(vm_offset_t gcc, const char *name, uint32_t off, unsigned us)
++{
++	uint32_t v = usb_rd(gcc, off);
++	ou_wr(gcc, off, v | 1u);
++	delay(us);
++	ou_wr(gcc, off, v & ~1u);
++	printf(OU_TAG "%s BCR 0x%05x pulsed (0x%08x -> 0x%08x)\n", name, off, v, usb_rd(gcc, off));
++}
++
++static int
++onclite_usb_power_up(vm_offset_t gcc)
++{
++	unsigned us;
++	bool ok;
++
++	printf(OU_TAG "start (LK clock_usb30_init + usb30_init, HS-only)\n");
++	/* GPLL0 feeds the master RCG, GPLL6 the mock-utmi RCG (LK clk_enable votes the parent PLL). */
++	if (!ou_pll_vote(gcc, "GPLL0", 1u << 0, GCC_GPLL0_MODE, 1u << 30)) {
++		return -1;
++	}
++	bool gpll6 = ou_pll_vote(gcc, "GPLL6", 1u << 7, GCC_GPLL6_STATUS, 1u << 17);
++
++	/* 1. usb30_iface_clk = gcc_pc_noc_usb3_axi_clk (plain branch, not voted) */
++	if (!ou_branch(gcc, USB_CLK_BUS, true)) {
++		return -1;
++	}
++	/* 2. clock_usb30_gdsc_enable: clear SW_COLLAPSE, then (unlike LK) wait for PWR_ON */
++	uint32_t g = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	ou_wr(gcc, GCC_USB30_PRIM_GDSCR, g & ~GDSC_SW_COLLAPSE);
++	ok = ou_poll(gcc, GCC_USB30_PRIM_GDSCR, GDSC_PWR_ON, GDSC_PWR_ON, 1000, &us);
++	printf(OU_TAG "GDSC 0x%08x -> 0x%08x %s after %u us\n", g, usb_rd(gcc, GCC_USB30_PRIM_GDSCR),
++	    ok ? "on" : "STILL OFF", us);
++	if (!ok) {
++		return -1;
++	}
++	/* 3. usb30_master_clk 133.33 MHz: F(133330000, gpll0, 6, 0, 0), set_rate_mnd:
++	 *    M 0, N ~(0-0)*0 = 0, D ~0, CFG src 1 | div 2*6-1 = 0x10b, MND mode bypass. */
++	if (!ou_rcg(gcc, "master", GCC_USB30_MASTER_CMD, (1u << 8) | 11u, true, 0, 0, 0xffffffffu) ||
++	    !ou_branch(gcc, USB_CLK_MASTER, true)) {
++		return -1;
++	}
++	/* 4. usb30_pipe_clk: branch with halt_check 0 (comes from the QMP PHY, which is not run). */
++	(void)ou_branch(gcc, 4, false);
++	/* 5. usb30_aux_clk 19.2 MHz: F(19200000, cxo, 1, 0, 0), set_rate_mnd: CFG src 0 | div 1. */
++	if (ou_rcg(gcc, "aux", GCC_USB3_AUX_CMD, 1u, true, 0, 0, 0xffffffffu)) {
++		(void)ou_branch(gcc, 5, false);
++	}
++	/* 6. usb30_mock_utmi_clk "60 MHz": F(60000000, gpll6, 6, 1, 3), set_rate_hid (CFG only:
++	 *    src gpll6_source_val 1 | div 11). Without GPLL6: XO entry F(19200000, cxo, 1, 0, 0). */
++	if (ou_rcg(gcc, "mock-utmi", GCC_USB30_MOCK_UTMI_CMD, gpll6 ? ((1u << 8) | 11u) : 1u, false, 0, 0, 0)) {
++		(void)ou_branch(gcc, 2, false);
++	}
++	/* 7. usb30_sleep_clk, 8. usb_phy_cfg_ahb_clk */
++	(void)ou_branch(gcc, 1, false);
++	bool phy_ahb = ou_branch(gcc, USB_CLK_PHY, true);
++	printf(OU_TAG "root CMD master 0x%08x aux 0x%08x mock-utmi 0x%08x (bit 31 = root off)\n",
++	    usb_rd(gcc, GCC_USB30_MASTER_CMD), usb_rd(gcc, GCC_USB3_AUX_CMD),
++	    usb_rd(gcc, GCC_USB30_MOCK_UTMI_CMD));
++
++	/* Gate: no DWC3/QSCRATCH access unless GDSC, master and iface report on. */
++	if (!(usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & GDSC_PWR_ON) ||
++	    (usb_rd(gcc, usb_cbcr[USB_CLK_MASTER].off) & CBCR_CLK_OFF) ||
++	    (usb_rd(gcc, usb_cbcr[USB_CLK_BUS].off) & CBCR_CLK_OFF)) {
++		printf(OU_TAG "GDSC/master/iface not all on; stopping before DWC3 access\n");
++		return -1;
++	}
++	if (!phy_ahb) {
++		printf(OU_TAG "phy-cfg-ahb off; QUSB2 PHY cannot be programmed, stopping\n");
++		return -1;
++	}
++	vm_offset_t dwc = ml_io_map(DWC3_PA, DWC3_SIZE);
++	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	vm_offset_t a2p = ml_io_map(AHB2PHY_PA, 0x400);
++	vm_offset_t tcsr = ml_io_map(TCSR_PHY_CLK_SCHEME_PA, 0x1000);
++	if (!dwc || !qs || !phy || !a2p || !tcsr) {
++		printf(OU_TAG "map failed\n");
++		return -1;
++	}
++	printf(OU_TAG "DWC3 GSNPSID 0x%08x GCTL 0x%08x; QSCRATCH GENERAL_CFG 0x%08x HS_PHY_CTRL 0x%08x\n",
++	    usb_rd(dwc, 0xc120), usb_rd(dwc, OU_GCTL), usb_rd(qs, QS_GENERAL_CFG),
++	    usb_rd(qs, QSCRATCH_HS_PHY_CTRL));
++
++	/* usb30_init, HPG 4.4.1: DBM bypass, RAM1 config 0 */
++	ou_wr(qs, QS_GENERAL_CFG, usb_rd(qs, QS_GENERAL_CFG) & ~QS_DBM_EN);
++	ou_wr(qs, QS_RAM1_REG, 0);
++	/* 2. controller into reset (dwc_reset(1): GCTL.CORESOFTRESET) */
++	ou_wr(dwc, OU_GCTL, usb_rd(dwc, OU_GCTL) | OU_GCTL_CORESOFTRESET);
++	/* 3. PHY reset (target_usb_phy_reset): usb30_qmp_phy_reset = USB3 PHY BCRs, then
++	 *    qusb2_phy_reset */
++	ou_bcr_pulse(gcc, "USB3_PHY", GCC_USB3_PHY_BCR, 100);
++	ou_bcr_pulse(gcc, "USB3PHY_PHY", GCC_USB3PHY_PHY_BCR, 100);
++	ou_bcr_pulse(gcc, "QUSB2_PHY", GCC_QUSB2_PHY_BCR, 10);
++	ou_wr(a2p, 0x10, 0x11);                 /* PERIPH_SS_AHB2PHY_TOP_CFG: wait states */
++	ou_wr(phy, QUSB2_PORT_POWERDOWN, 0x23); /* CLAMP_N_EN, PHY disabled */
++	uint32_t se_clock = usb_rd(tcsr, 0x44) & 1;
++	/* platform_is_msm8953() branch; no QFPROM_CORR_CALIB_ROW12_MSB in 8953 iomap -> TUNE2 0xb3 */
++	ou_wr(phy, QUSB2_PORT_TUNE1, 0xf8);
++	ou_wr(phy, QUSB2_PORT_TUNE2, 0xb3);
++	ou_wr(phy, QUSB2_PORT_TUNE3, 0x83);
++	ou_wr(phy, QUSB2_PORT_TUNE4, 0xc0);
++	ou_wr(phy, QUSB2_PLL_TUNE, 0x30);
++	ou_wr(phy, QUSB2_PLL_USER_CTL1, 0x79);
++	ou_wr(phy, QUSB2_PLL_USER_CTL2, 0x21);
++	ou_wr(phy, QUSB2_PORT_TEST2, 0x14);
++	ou_wr(phy, QUSB2_PLL_AUTOPGM_CTL1, 0x9f);
++	ou_wr(phy, QUSB2_PLL_PWR_CTL, 0x00);
++	ou_wr(phy, QUSB2_PORT_POWERDOWN, 0x22); /* CLAMP_N_EN, PHY enabled */
++	delay(150);
++	if (se_clock) {
++		ou_wr(phy, QUSB2_PLL_TEST, 0x80);
++	}
++	delay(100);
++	ok = ou_poll(phy, QUSB2_PLL_STATUS, QUSB2_PLL_LOCK, QUSB2_PLL_LOCK, 500, &us);
++	printf(OU_TAG "QUSB2 TCSR clk scheme %s, PLL_STATUS 0x%08x %s after %u us, POWERDOWN 0x%08x "
++	    "TUNE1-4 %02x %02x %02x %02x\n", se_clock ? "single-ended" : "differential",
++	    usb_rd(phy, QUSB2_PLL_STATUS), ok ? "LOCKED" : "NOT LOCKED (continuing, as LK)", us,
++	    usb_rd(phy, QUSB2_PORT_POWERDOWN), usb_rd(phy, QUSB2_PORT_TUNE1), usb_rd(phy, QUSB2_PORT_TUNE2),
++	    usb_rd(phy, QUSB2_PORT_TUNE3), usb_rd(phy, QUSB2_PORT_TUNE4));
++	/* 4. SS PHY config skipped (HS-only). 5. HS PHY init: FREECLK_SEL 0, COMMONONN 1 */
++	ou_wr(qs, QSCRATCH_HS_PHY_CTRL, (usb_rd(qs, QSCRATCH_HS_PHY_CTRL) & ~QS_HS_FREECLK_SEL) | QS_HS_COMMONONN);
++	/* 6. HS PHY config */
++	ou_wr(qs, QS_PARAMETER_OVERRIDE_X, 0xd190e4);
++	/* 7. PHY digital interface reset (dwc_phy_digital_reset) */
++	ou_wr(dwc, OU_GUSB2PHYCFG, usb_rd(dwc, OU_GUSB2PHYCFG) | OU_U2_PHYSOFTRST);
++	ou_wr(dwc, OU_GUSB3PIPECTL, usb_rd(dwc, OU_GUSB3PIPECTL) | OU_U3_PHYSOFTRST);
++	delay(100);
++	ou_wr(dwc, OU_GUSB2PHYCFG, usb_rd(dwc, OU_GUSB2PHYCFG) & ~OU_U2_PHYSOFTRST);
++	ou_wr(dwc, OU_GUSB3PIPECTL, usb_rd(dwc, OU_GUSB3PIPECTL) & ~OU_U3_PHYSOFTRST);
++	delay(100);
++	/* 8. controller out of reset */
++	ou_wr(dwc, OU_GCTL, usb_rd(dwc, OU_GCTL) & ~OU_GCTL_CORESOFTRESET);
++	/* usb_wrapper_hsonly_mode: pipe interface clocked from UTMI, PHYSTATUS from software */
++	ou_wr(qs, QS_GENERAL_CFG, usb_rd(qs, QS_GENERAL_CFG) | QS_PIPE_UTMI_CLK_DIS);
++	delay(1);
++	ou_wr(qs, QS_GENERAL_CFG, usb_rd(qs, QS_GENERAL_CFG) | QS_PIPE_UTMI_CLK_SEL | QS_PIPE3_PHYSTATUS_SW);
++	delay(1);
++	ou_wr(qs, QS_GENERAL_CFG, usb_rd(qs, QS_GENERAL_CFG) & ~QS_PIPE_UTMI_CLK_DIS);
++	/* 13. LOS_BIAS 5 */
++	ou_wr(qs, QS_SS_PHY_PARAM_CTRL_1, (usb_rd(qs, QS_SS_PHY_PARAM_CTRL_1) & ~7u) | 5u);
++	onclite_usb_powered = true;
++	return 0;
++}
++
++/* LK dwc_gctl_init (dwc_device_init step 16): device mode, no suspend, no clock gating. */
++static void
++onclite_dwc_gctl_init(vm_offset_t dwc)
++{
++	uint32_t gctl = usb_rd(dwc, OU_GCTL);
++	gctl &= ~(OU_GCTL_DEBUGATTACH | OU_GCTL_CORESOFTRESET | OU_GCTL_PRTCAPDIR | OU_GCTL_FRMSCLDWN |
++	    OU_GCTL_PWRDNSCALE | OU_GCTL_DSBLCLKGTNG);
++	gctl |= (2u << 12) | OU_GCTL_U2RSTECN | (2u << 19);
++	ou_wr(dwc, OU_GCTL, gctl);
++	ou_wr(dwc, OU_GUSB2PHYCFG, usb_rd(dwc, OU_GUSB2PHYCFG) & ~(OU_U2_SUSPHY | OU_U2_ENBLSLPM));
++	ou_wr(dwc, OU_GUSB3PIPECTL, usb_rd(dwc, OU_GUSB3PIPECTL) & ~(OU_U3_SUSPHY | OU_U3_DELAYP1TRANS));
++	printf(OU_TAG "GCTL 0x%08x GUSB2PHYCFG 0x%08x GUSB3PIPECTL 0x%08x\n",
++	    usb_rd(dwc, OU_GCTL), usb_rd(dwc, OU_GUSB2PHYCFG), usb_rd(dwc, OU_GUSB3PIPECTL));
++}
++#endif /* ONCLITE */
++
  void
  sweet_usb_probe(void)
  {
@@ -134,6 +461,27 @@ index b6c1a41..ca6abae 100644
 +	/* DWC3 registers need the GDSC, the master clock and the bus (NoC) path. */
 +	clocks_on = (gdscr & GDSC_PWR_ON) && !(cbcr[USB_CLK_MASTER] & CBCR_CLK_OFF) &&
 +	    !(cbcr[USB_CLK_BUS] & CBCR_CLK_OFF);
++#if defined(ONCLITE)
++	/* Normal boot: power the block up ourselves (sweetusb>=2 only; 1 stays read-only). */
++	if (!clocks_on && enabled >= 2) {
++		int rc = onclite_usb_power_up(gcc);
++		gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++		for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
++			cbcr[i] = usb_rd(gcc, usb_cbcr[i].off);
++		}
++		clocks_on = rc == 0 && (gdscr & GDSC_PWR_ON) && !(cbcr[USB_CLK_MASTER] & CBCR_CLK_OFF) &&
++		    !(cbcr[USB_CLK_BUS] & CBCR_CLK_OFF);
++		printf(UD_TAG "power-up %s (rc %d): GDSC 0x%08x master 0x%08x iface 0x%08x phy-ahb 0x%08x\n",
++		    clocks_on ? "done" : "FAILED", rc, gdscr, cbcr[USB_CLK_MASTER], cbcr[USB_CLK_BUS],
++		    cbcr[USB_CLK_PHY]);
++		if (clocks_on) {
++			vm_offset_t d = ml_io_map(DWC3_PA, DWC3_SIZE);
++			if (d != 0) {
++				onclite_dwc_gctl_init(d);
++			}
++		}
++	}
++#endif
  	if (!clocks_on) {
 -		printf("SWEET USB: controller unpowered or unclocked; DWC3 not read\n");
 +		printf(UD_TAG "controller unpowered or unclocked (bootloader did not start USB?); "
@@ -198,7 +546,7 @@ index b6c1a41..ca6abae 100644
  }
  
  /*
-@@ -141,7 +226,8 @@ sweet_usb_probe(void)
+@@ -141,7 +571,8 @@ sweet_usb_probe(void)
   * up, so only the device controller is restarted: soft reset, an event
   * buffer in our memory, endpoint 0, run. Events are polled from a kernel
   * thread (no interrupt), like the UFS driver. DMA is not cache coherent
@@ -208,7 +556,7 @@ index b6c1a41..ca6abae 100644
   * Register layout and the control-transfer state machine follow the
   * Synopsys DWC3 databook as used by Linux drivers/usb/dwc3 (gadget.c,
   * ep0.c).
-@@ -167,12 +253,7 @@ sweet_usb_probe(void)
+@@ -167,12 +598,7 @@ sweet_usb_probe(void)
   * session; Linux dwc3-qcom forces that in software when the charger
   * reports a cable (dwc3_qcom_vbus_override_enable).
   */
@@ -222,7 +570,7 @@ index b6c1a41..ca6abae 100644
  
  #define DCTL_RUN_STOP   (1u << 31)
  #define DCTL_CSFTRST    (1u << 30)
-@@ -278,14 +359,14 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+@@ -278,14 +704,14 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
  		if (!(v & DEPCMD_CMDACT)) {
  			uint32_t status = (v >> 12) & 0xf;
  			if (status) {
@@ -239,7 +587,7 @@ index b6c1a41..ca6abae 100644
  	return -1;
  }
  
-@@ -351,7 +432,11 @@ static const uint8_t ud_cfg_desc[80] = {
+@@ -351,7 +777,11 @@ static const uint8_t ud_cfg_desc[80] = {
  };
  /* The host side's MAC (ECM iMACAddress); the phone's own is ..:02 */
  static const char *const ud_strings[] = {
@@ -251,7 +599,7 @@ index b6c1a41..ca6abae 100644
  };
  static const uint8_t ud_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
  
-@@ -407,13 +492,13 @@ ud_configure(void)
+@@ -407,13 +837,13 @@ ud_configure(void)
  	    ud_epcmd(EP_INT, DEPCMD_SETEPCONFIG, (3u << 1) | (16u << 3) | (2u << 17),
  	    (1u << 8) | (8u << 16) | ((uint32_t)EP_INT << 25), 0) ||
  	    ud_epcmd(EP_INT, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
@@ -267,7 +615,7 @@ index b6c1a41..ca6abae 100644
  }
  
  static void
-@@ -428,7 +513,7 @@ ud_setup(void)
+@@ -428,7 +858,7 @@ ud_setup(void)
  	uint32_t n = 0;
  	bool ok = true;
  
@@ -276,7 +624,7 @@ index b6c1a41..ca6abae 100644
  	ud.data_in = (type & 0x80) != 0;
  	if ((type & 0x60) == 0x20) {    /* class request (e.g. SET_ETHERNET_PACKET_FILTER) */
  		ok = (length == 0);
-@@ -444,12 +529,12 @@ ud_setup(void)
+@@ -444,12 +874,12 @@ ud_setup(void)
  	} else if (req == 5) {          /* SET_ADDRESS: takes effect now (DWC3 handles the timing) */
  		uint32_t dcfg = dwc_rd(DCFG) & ~(0x7fu << 3);
  		dwc_wr(DCFG, dcfg | ((uint32_t)(value & 0x7f) << 3));
@@ -291,7 +639,7 @@ index b6c1a41..ca6abae 100644
  	} else if (req == 8) {          /* GET_CONFIGURATION */
  		data[0] = ud.configured ? 1 : 0; n = 1;
  	} else if (req == 0) {          /* GET_STATUS */
-@@ -660,7 +745,7 @@ ud_if_create(void)
+@@ -660,7 +1090,7 @@ ud_if_create(void)
  	init.broadcast_addr = etherbroadcastaddr;
  	init.broadcast_len = ETHER_ADDR_LEN;
  	if (ifnet_allocate_extended(&init, &ud.ifp) != 0) {
@@ -300,7 +648,7 @@ index b6c1a41..ca6abae 100644
  		ud.ifp = NULL;
  		return;
  	}
-@@ -670,7 +755,7 @@ ud_if_create(void)
+@@ -670,7 +1100,7 @@ ud_if_create(void)
  	ifnet_set_baudrate(ud.ifp, 480000000);
  	ifnet_set_flags(ud.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
  	if (ifnet_attach(ud.ifp, NULL) != 0) {
@@ -309,7 +657,7 @@ index b6c1a41..ca6abae 100644
  		ud.ifp = NULL;
  		return;
  	}
-@@ -701,7 +786,7 @@ ud_if_create(void)
+@@ -701,7 +1131,7 @@ ud_if_create(void)
  		sock_close(so);
  	}
  	ifnet_set_flags(ud.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
@@ -318,7 +666,7 @@ index b6c1a41..ca6abae 100644
  }
  
  static void
-@@ -711,7 +796,7 @@ ud_event(uint32_t ev)
+@@ -711,7 +1141,7 @@ ud_event(uint32_t ev)
  		uint32_t type = (ev >> 8) & 0xf;
  		if (type == 1) {        /* USB reset */
  			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
@@ -327,7 +675,7 @@ index b6c1a41..ca6abae 100644
  		} else if (type == 2) { /* connect done */
  			uint32_t speed = dwc_rd(DSTS) & 7;
  			/* ep0 max packet: 64 at high/full speed (modify action) */
-@@ -719,9 +804,9 @@ ud_event(uint32_t ev)
+@@ -719,9 +1149,9 @@ ud_event(uint32_t ev)
  			    (1u << 8) | (1u << 10) | (0u << 25), 0);
  			ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (64u << 3) | (2u << 30),
  			    (1u << 8) | (1u << 10) | (1u << 25), 0);
@@ -339,7 +687,7 @@ index b6c1a41..ca6abae 100644
  		}
  		return;
  	}
-@@ -787,14 +872,14 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -787,14 +1217,14 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
  				uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
  				ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
  				if (ud.events++ < 200) {
@@ -356,7 +704,7 @@ index b6c1a41..ca6abae 100644
  		}
  		ud_sleep_ms(1);
  	}
-@@ -854,9 +939,16 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+@@ -854,9 +1284,16 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  	thread_t thread;
  
  	ud.dwc = dwc;
@@ -374,7 +722,7 @@ index b6c1a41..ca6abae 100644
  		return;
  	}
  	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)ud.dma);
-@@ -866,13 +958,13 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+@@ -866,17 +1303,23 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  	ud.dma_pa = ptoa_64(pn);
  	ud_if_create();
  
@@ -390,7 +738,17 @@ index b6c1a41..ca6abae 100644
  	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
  	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
  		return;
-@@ -896,7 +988,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	}
++#if defined(ONCLITE)
++	/* After our own power-up: LK order is DCTL soft reset (step 15), then GCTL init (16). */
++	if (onclite_usb_powered) {
++		onclite_dwc_gctl_init(dwc);
++	}
++#endif
+ 
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+@@ -896,7 +1339,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  	    ud_epcmd(0, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
  	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
  	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
@@ -399,7 +757,7 @@ index b6c1a41..ca6abae 100644
  		return;
  	}
  	dwc_wr(DALEPENA, 0x3);
-@@ -905,12 +997,18 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+@@ -905,12 +1348,18 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
  	if (qs != 0) {
  		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
@@ -420,7 +778,7 @@ index b6c1a41..ca6abae 100644
  		    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
  	}
  
-@@ -918,7 +1016,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+@@ -918,7 +1367,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
  		delay(1000);
  	}
