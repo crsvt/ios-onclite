@@ -39,6 +39,7 @@
 
 static inline void wr32(uintptr_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
 static inline void wr8(uintptr_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
+static inline uint32_t rd32(uintptr_t a) { return *(volatile uint32_t *)a; }
 
 /* ---- ramoops console: struct persistent_ram_buffer { sig, start, size, data[] } ---- */
 
@@ -108,6 +109,14 @@ static void delay_ms(unsigned ms)
 		;
 }
 
+static void delay_us(unsigned us)
+{
+	__asm__ volatile("isb" ::: "memory");
+	uint64_t end = rsr("cntpct_el0") + rsr("cntfrq_el0") / 1000000 * us + 1;
+	while (rsr("cntpct_el0") < end)
+		;
+}
+
 static void __attribute__((noreturn)) fail(const char *why)
 {
 	plog_str("SHIM FAIL ");
@@ -120,6 +129,66 @@ static void __attribute__((noreturn)) fail(const char *why)
 	wr32(PSHOLD, 0);
 	for (;;)
 		__asm__ volatile("wfe");
+}
+
+/*
+ * ---- Gold cluster clock ----
+ * LK runs on Silver and leaves the Gold (perf, C1) mux on XO: xnu measured
+ * ~19.2 MHz on the Gold cores (H1). Before CPU_ON, switch it to GPLL0 /1 =
+ * 800 MHz, as Linux clock-cpu-sdm632.c does before the Gold cores come up
+ * (and lk2nd): no voltage change. Faster needs the C1 PLL plus a VDD_APC
+ * (PM8953 S5) check; the state for that is logged here.
+ * .claude/research/gold-clock-report.md.
+ */
+#define GOLD_MUX_CMD	0x0b011050UL
+#define GOLD_MUX_CFG	0x0b011054UL
+#define GOLD_CBCR	0x0b011058UL
+#define GOLD_PLL	0x0b016000UL
+#define GPLL0_MODE	0x01821000UL
+#define GPLL_ENA_VOTE	0x01845000UL
+#define APC_SAW_VLEVEL	0x0b1d2c18UL
+#define APC_SAW_VERSION	0x0b1d2fd0UL
+#define SPEED_BIN_FUSE	0x000a4124UL
+
+static void gold_clock_log(const char *when)
+{
+	plog_line(when);
+	plog_hex("GOLD mux cmd", rd32(GOLD_MUX_CMD));
+	plog_hex("GOLD mux cfg", rd32(GOLD_MUX_CFG));
+	plog_hex("GOLD cbcr", rd32(GOLD_CBCR));
+}
+
+static void gold_clock(void)
+{
+	gold_clock_log("GOLD clock before");
+	plog_hex("GOLD pll mode", rd32(GOLD_PLL));
+	plog_hex("GOLD pll L", rd32(GOLD_PLL + 0x08));
+	plog_hex("GPLL0 mode", rd32(GPLL0_MODE));
+	plog_hex("APC SAW version", rd32(APC_SAW_VERSION));
+	plog_hex("APC SAW vlevel", rd32(APC_SAW_VLEVEL));
+	plog_hex("SPEED bin fuse", rd32(SPEED_BIN_FUSE));
+	if (!(rd32(GPLL0_MODE) & (1u << 30))) {
+		wr32(GPLL_ENA_VOTE, rd32(GPLL_ENA_VOTE) | 1);
+		dsb();
+		for (int i = 0; i < 200 && !(rd32(GPLL0_MODE) & (1u << 30)); i++)
+			delay_us(1);
+		if (!(rd32(GPLL0_MODE) & (1u << 30))) {
+			plog_line("GOLD GPLL0 not active: clock left as is");
+			return;
+		}
+	}
+	wr32(GOLD_MUX_CFG, 0x401);	/* source 4 = GPLL0, divider /1 */
+	dsb();
+	wr32(GOLD_MUX_CMD, rd32(GOLD_MUX_CMD) | 1);	/* UPDATE */
+	dsb();
+	int i;
+	for (i = 0; i < 500 && (rd32(GOLD_MUX_CMD) & 1); i++)
+		delay_us(1);
+	if (rd32(GOLD_MUX_CMD) & 1)
+		plog_line("GOLD mux UPDATE did not clear");
+	wr32(GOLD_CBCR, rd32(GOLD_CBCR) | 1);
+	dsb();
+	gold_clock_log("GOLD clock after (GPLL0 800 MHz)");
 }
 
 /* ---- exceptions: anything here is a shim bug ---- */
@@ -186,6 +255,21 @@ static void zero64(uintptr_t dst, uint64_t n)
 	volatile uint64_t *d = (volatile uint64_t *)dst;
 	for (uint64_t i = 0; i < n / 8; i++)
 		d[i] = 0;
+}
+
+/* Whole-word boot-arg match in the payload's command line (no libc here). */
+static int cmdline_has(const char *line, const char *arg)
+{
+	for (int i = 0; i < BOOT_LINE_LENGTH && line[i]; i++) {
+		if (i && line[i - 1] != ' ')
+			continue;
+		int j = 0;
+		while (arg[j] && i + j < BOOT_LINE_LENGTH && line[i + j] == arg[j])
+			j++;
+		if (!arg[j] && (i + j >= BOOT_LINE_LENGTH || line[i + j] == ' ' || !line[i + j]))
+			return 1;
+	}
+	return 0;
 }
 
 static int magic_ok(const char *m)
@@ -272,6 +356,15 @@ void shim_main(uint64_t dtb)
 	 * and caches off and x0 = context id = boot_args, as __start expects.
 	 * Everything above was written with the MMU and caches off.
 	 */
+	stage = "gold clock";
+	int gold_clk = 1;
+	if (cmdline_has(p->cmdline, "onclite_goldclk=0"))
+		gold_clk = 0;
+	if (gold_clk)
+		gold_clock();
+	else
+		plog_line("GOLD clock left on XO (onclite_goldclk=0)");
+
 	stage = "handoff";
 	uintptr_t entry_pa = p->entry_va + pa_of_va_base;
 	plog_hex("JUMP pa", entry_pa);
