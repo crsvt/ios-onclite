@@ -3,7 +3,8 @@
 #   tools/onclite-usbnet-mac.sh [LOGFILE]     (default logs/live-onclite.txt)
 # Waits for the phone's CDC-ECM interface (macOS drives CDC-ECM natively; the
 # interface carries the host MAC 02:00:5e:77:ee:01 from the phone's descriptor),
-# gives it 192.168.7.1/24 (phone = 192.168.7.2), then prints the kernel console
+# gives it 192.168.7.1/24 (phone = 192.168.7.2; asks for the admin password in a
+# macOS dialog if sudo needs one), then prints the kernel console
 # the phone streams to UDP 5140 and appends it to LOGFILE. Ctrl-C stops.
 set -eu
 mac=02:00:5e:77:ee:01
@@ -27,6 +28,8 @@ until ifconfig "$ifname" | grep -q "inet 192.168.7.1 "; do
 		$cmd
 	elif sudo -n true 2>/dev/null; then
 		sudo $cmd
+	elif osascript -e "do shell script \"$cmd\" with administrator privileges" >/dev/null 2>&1; then
+		: # macOS password dialog (no terminal needed)
 	else
 		echo "needs root; run this in Claude Code (or a terminal), the script keeps waiting:" >&2
 		echo "  ! sudo $cmd" >&2
