@@ -306,6 +306,21 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   terminal for sudo: `! osascript -e 'do shell script "ifconfig en6 inet 192.168.7.1 netmask 255.255.255.0 alias up"
   with administrator privileges'`, receiver `tools/onclite-usbnet-mac.sh logs/live-NAME.txt`. The stream starts with
   the last 64 KiB (early boot lines are only in ramoops).
+- **H9 live log findings:** Settings > About hangs in -[PSGAboutDataSource _macAddress] ->
+  SCNetworkInterfaceCopyAllWithPreferences -> __wait_for_IOKit_to_quiesce (SCDynamicStoreNotifyWait): configd's
+  InterfaceNamer only posts "quiet" after opening an IONetworkStack (missing: no IONetworkingFamily), else after
+  WaitStackTimeout 300 s (About then opened, user confirmed). bluetoothd 53x, fairplayd.H2 54x launches in 12 min;
+  vmd burning 59 % CPU.
+- **H10 (09:27, kernel 26 = CI 25acb92):** IONetworkStack stand-in (SweetPlatformExpert.cpp), onclite_noexec (default
+  bluetoothd,fairplayd.H2,vmd; 0113 kern_exec.c) -> each refused 2-3x then launchd backs off; DCS backlight: display
+  off = 0x51 0 + 0x28, on = 0x29 + 0x51 level (DSI0 0x1a94000 cmd DMA, packet in the shadow region's last page;
+  method from ios-topaz 0104/0106) -> `panel off/on by DCS: done/done`, user: backlight off works. USB poll 5 ms.
+  Still laggy.
+- **H11 (09:53, kernel 27 = CI 2186a6c):** VDD_APC readout: `S5 type 0x1c/0x09 range 0 vset 0x9e -> 870 mV`
+  (FTS2.5). USB PHY L3 OFF, L13 OFF (USB HS works anyway), L7 ON, L10 ON (RPM vote). onclite_goldmhz=1400 picked
+  the 1094.4 MHz corner (corners <= request; 1401.6 needs =1402). Rail 870 >= 865 mV allows 1094.4 and 1401.6, not
+  1555.2/1804.8 (920/990 mV).
+- H12: onclite_goldmhz=1402 (1401.6 MHz). Receiver now asks for the admin password itself (osascript).
 - Open: PosterBoard first-time setup trap (wallpaper), About page (MobileGestalt, maybe fixed by the MACs), AppOS apps
   not installed (installcoordinationd?), CPU above 800 MHz needs the S5 reading, iOS 16 lag (CPU rendering).
 - **0108 touch (`bsd/dev/onclite_touch.c`, CI 39332051381):** FT5446 @0x38 on BLSP1 QUP3 0x78b7000, polled FIFO
