@@ -1,9 +1,9 @@
 diff --git a/bsd/dev/onclite_touch.c b/bsd/dev/onclite_touch.c
 new file mode 100644
-index 0000000..e692874
+index 0000000..35c9f4c
 --- /dev/null
 +++ b/bsd/dev/onclite_touch.c
-@@ -0,0 +1,820 @@
+@@ -0,0 +1,841 @@
 +/*
 + * onclite touch: FocalTech FT5446 (I2C 0x38) on BLSP1 QUP3 (0x78b7000).
 + *
@@ -655,7 +655,21 @@ index 0000000..e692874
 +	}
 +	unsigned n = buf[2] & 15u;
 +	unsigned slots = (ot.report_len - 3u) / 6u;
-+	if ((buf[0] & 0x70u) || n > FTS_POINTS) {
++	/*
++	 * No finger: the FT5446 answers an all-0xff frame (TD_STATUS 0xff, as
++	 * ios-topaz 86b78f5 found on the FT5452). H7 counted ~3900 of these as
++	 * errors. Release everything instead.
++	 */
++	if (buf[2] == 0xffu || n > FTS_POINTS) {
++		touch_report(0, x, y);
++		return 0;
++	}
++	if (buf[0] & 0x70u) {
++		static unsigned logged;
++		if (logged++ < 5) {
++			printf("ONCLITE TOUCH: rejected frame %02x %02x %02x | %02x %02x %02x %02x %02x %02x\n",
++			    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]);
++		}
 +		return EIO;
 +	}
 +	for (unsigned i = 0; i < slots; ++i) {
@@ -664,18 +678,15 @@ index 0000000..e692874
 +		if (id >= FTS_POINTS) {
 +			break;          /* 0xF: empty slot, no more records */
 +		}
-+		if (seen & (1u << id)) {
-+			return EIO;
++		if (event == 1u || event == 3u || (seen & (1u << id))) {
++			continue;       /* up / no event (ios-topaz cd3c6c6) / repeated slot */
 +		}
 +		seen |= 1u << id;
-+		if (event == 1u || event == 3u) {
-+			continue;       /* up / no event */
-+		}
 +		int px = ((p[0] & 15) << 8) | p[1];
 +		int py = ((p[2] & 15) << 8) | p[3];
-+		if (px >= FTS_PANEL_W || py >= FTS_PANEL_H) {
-+			return EIO;
-+		}
++		/* Edge touches can report the panel size itself: clamp. */
++		px = px >= FTS_PANEL_W ? FTS_PANEL_W - 1 : px;
++		py = py >= FTS_PANEL_H ? FTS_PANEL_H - 1 : py;
 +		mask |= 1u << id;
 +		x[id] = px;
 +		y[id] = py;
@@ -783,8 +794,18 @@ index 0000000..e692874
 +	ot.report_len = 3u + 6u * (slots < FTS_POINTS ? slots : FTS_POINTS);
 +	printf("ONCLITE TOUCH: FT5446 ready, %u points, %ux%u -> canvas, poll 10 ms\n",
 +	    (ot.report_len - 3u) / 6u, FTS_PANEL_W, FTS_PANEL_H);
-+	unsigned errors = 0;
++	unsigned errors = 0, ticks = 0;
 +	for (;;) {
++		/*
++		 * Each report read busy-waits ~1.5 ms on the bus: read only while
++		 * the IC's INT (GPIO65, active low) is asserted or a finger is
++		 * down, else every 100 ms (ios-topaz 58bd4dd, IRQ-gated polling).
++		 */
++		bool irq = !(rd32(ot.tlmm, TLMM_IO(GPIO_INT)) & 1u);
++		if (!irq && ot.active == 0 && (++ticks % 10u) != 0) {
++			touch_wait(10);
++			continue;
++		}
 +		int err = touch_poll();
 +		if (err) {
 +			if ((errors++ % 100u) == 0) {
