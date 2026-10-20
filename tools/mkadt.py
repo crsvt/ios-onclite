@@ -128,7 +128,15 @@ def build(seed=None, qemu=False, highmem=False, onclite=False):
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
-    ], [node('memory-map', [ph()]),
+    ] + ([
+        # MobileGestalt's Wi-Fi/Bluetooth addresses (set by iBoot on real
+        # devices). Without them it waits for an IONetworkController and
+        # times out once per question: lsd's first seed crawls and Settings
+        # stalls (ry-diffusion/ios-beryllium ae85413). Synthetic locally
+        # administered addresses, not the phone's.
+        ('mac-address-wifi0', bytes([0x02, 0x00, 0x5e, 0x77, 0xe0, 0x07])),
+        ('mac-address-bluetooth0', bytes([0x02, 0x00, 0x5e, 0x77, 0xb0, 0x07])),
+    ] if onclite else []), [node('memory-map', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
         # debugger, dtrace, nvram), lp-sip1: unauthenticated (unsealed) root.
