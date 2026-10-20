@@ -247,6 +247,14 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   USB only in fastboot mode). G1 attempt at ~05:00 IST: phone not seen on USB at all afterwards; state unknown.
 - **DIAG kernel (CI 01baf95):** every sampler snapshot prints `DIAG cpuN clock ~MHz`, per-core timer/irq/ipi counts,
   VM free/active/inactive/wired/compressed pages, eMMC reads/writes/KiB/busy ms/KiB/s, LSE count. Next run: measure.
+- **H1 (06:01 IST, kernel out-onclite-18, flashed boot, `logs/xnu-h1-diag.txt`): ROOT CAUSE OF THE SLOWNESS FOUND.**
+  `DIAG cpu0 clock ~12 MHz (20M adds in 1562925 us)`: the Gold cluster runs at ~19.2 MHz (XO; loop ~1.5 cycles per
+  iteration), not ~1.8 GHz. Nothing switches C1 to its PLL after our CPU_ON. Fix next: program the perf PLL + mux
+  (research `.claude/research/gold-clock-report.md`). Also measured: per-core timers all firing (timer 7456/6072/6172/
+  4716, ipi 668/483/358/208 at sample 0); LSE emulated 0 by sample 0; **PMIC L10 OFF** (status1 0x00, en_ctl 0x00,
+  owner EE 4) and L6 ON -> touch needs an RPM vote (`.claude/research/rpm-l10-report.md`); USB GDSC + all USB clocks
+  off on a normal boot (live log needs `fastboot boot`). DIAG then panicked (my bug: cpu_datap past
+  ml_get_max_cpu_number; fixed, CI pushed).
 - **0108 touch (`bsd/dev/onclite_touch.c`, CI 39332051381):** FT5446 @0x38 on BLSP1 QUP3 0x78b7000, polled FIFO
   transfers with V2 tags, GCC BLSP1 AHB vote + QUP3 RCG XO/1 + CBCR, GPIO10/11 func 2, reset GPIO64, chip ID
   0xA3/0x9F, report reg 0x00 every 10 ms, panel 720x1520 -> canvas -> sweet 1080x2400 coordinates for
