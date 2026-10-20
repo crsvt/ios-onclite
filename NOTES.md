@@ -261,6 +261,16 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   (bits[10:8] = 6). After: cfg 0x401, cbcr 0x1. XNU then ran much faster, but eMMC init failed: `CMD6 arg 0x3b70200
   failed (60): status 0x0` right after CMD7 -> no root -> panic -> PS_HOLD restart to TWRP. Fix (pushed): 100 us gaps
   between ARGUMENT/TRANSFER_MODE/COMMAND writes while the card clock is < 1 MHz, 2 ms after CMD7.
+- **🎉 H3 (06:29 IST, kernel out-onclite-20 + Gold 800 MHz shim, `logs/xnu-h3-goldclk.txt`): iOS LOCK SCREEN ON THE
+  REDMI 7** (user: date, time and battery shown, rest black). eMMC fix works. Apple logo ~1.5 min after boot. DIAG:
+  `clock ~533 MHz` (3-instruction loop at ~1.5 cycles = 800 MHz), timers on all 4 cores, LSE emulated 0, eMMC 1.27 GB
+  read + 0.79 GB written, 45 MB/s while busy (busy 46 s total), VM free ~1900 pages (30 MB), compressed 0.
+  SpringBoard waited on the LaunchServices seed until between samples 6 and 7 (~14-15 min after the root), then
+  idle in its run loop (lock screen). 32 swaps.
+- **🎉 H4 (06:50:42 IST, same images, second boot): lock screen in ~2 minutes** (user report 06:52). The
+  LaunchServices database was kept, so only the first boot pays the seed. Touch still dead (L10 off).
+- Committed, not built: timer restart calls reboot_kernel(RB_QUICK) to sync file systems before PS_HOLD.
+- Touch blocked on the RPM SMD request for L10 (recipe `.claude/research/rpm-l10-report.md`); not implemented yet.
 - **0108 touch (`bsd/dev/onclite_touch.c`, CI 39332051381):** FT5446 @0x38 on BLSP1 QUP3 0x78b7000, polled FIFO
   transfers with V2 tags, GCC BLSP1 AHB vote + QUP3 RCG XO/1 + CBCR, GPIO10/11 func 2, reset GPIO64, chip ID
   0xA3/0x9F, report reg 0x00 every 10 ms, panel 720x1520 -> canvas -> sweet 1080x2400 coordinates for
