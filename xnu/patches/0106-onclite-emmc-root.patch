@@ -15,10 +15,10 @@ index 6630131..25fd732 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/onclite_emmc.c b/bsd/dev/onclite_emmc.c
 new file mode 100644
-index 0000000..07a89c2
+index 0000000..b57d568
 --- /dev/null
 +++ b/bsd/dev/onclite_emmc.c
-@@ -0,0 +1,1196 @@
+@@ -0,0 +1,1216 @@
 +/*
 + * onclite internal eMMC root device.
 + *
@@ -425,6 +425,17 @@ index 0000000..07a89c2
 +	wr16(SDHCI_COMMAND, (uint16_t)((index << 8) | resp_flags | (count ? CMD_DATA : 0)));
 +
 +	int error = emmc_wait(INT_CMD_COMPLETE, &status);
++	if (error == ETIMEDOUT && (resp_flags & CMD_RESP_48_BUSY) == CMD_RESP_48_BUSY && !count &&
++	    (status & INT_XFER_COMPLETE)) {
++		/*
++		 * R1b whose busy end (XFER_COMPLETE) was latched but whose
++		 * CMD_COMPLETE never showed (H6, CMD7): the response register is
++		 * valid once the busy phase is over.
++		 */
++		printf("ONCLITE EMMC: CMD%u: busy end without command complete (status 0x%x), accepted\n",
++		    index, status);
++		error = 0;
++	}
 +	if (!error) {
 +		*r1 = rd32(SDHCI_RESPONSE);
 +		if (count || (resp_flags & CMD_RESP_48_BUSY) == CMD_RESP_48_BUSY) {
@@ -700,7 +711,16 @@ index 0000000..07a89c2
 +		return 0;
 +	}
 +	printf("ONCLITE EMMC: card not in transfer state (%d, 0x%x): identifying it again\n", error, r1);
-+	return emmc_init_card();
++	/* Identification is occasionally lost (H6: CMD7 never completed): retry it. */
++	for (int attempt = 1;; attempt++) {
++		error = emmc_init_card();
++		if (!error || attempt == 3) {
++			return error;
++		}
++		printf("ONCLITE EMMC: identification attempt %d failed (%d), retrying\n", attempt, error);
++		emmc_reset_lines();
++		delay(10000);
++	}
 +}
 +
 +static int
