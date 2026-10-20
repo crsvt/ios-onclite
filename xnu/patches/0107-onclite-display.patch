@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index a62416c..83b4660 100644
+index a62416c..93b7cab 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -25,10 +25,18 @@
@@ -82,7 +82,7 @@ index a62416c..83b4660 100644
  
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
  	void addClient(IOMobileFramebufferUserClient *client);
-@@ -126,6 +171,203 @@ public:
+@@ -126,6 +171,213 @@ public:
  
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
  
@@ -206,6 +206,9 @@ index a62416c..83b4660 100644
 +	if (fPanel == 0 || fPixels == 0) {
 +		return;
 +	}
++	/* Cost of the CPU scale+convert, logged every 200 copies (lag hunt). */
++	static uint64_t copies, total_abs;
++	uint64_t t0 = mach_absolute_time();
 +	for (uint32_t y = 0; y < fOutH; y++) {
 +		const volatile uint32_t *src = (const volatile uint32_t *)(fPixels + (uint64_t)fMapY[y] * fRowBytes);
 +		volatile uint8_t *dst = (volatile uint8_t *)(fPanel + (uint64_t)(fOutY + y) * fPanelStride + fOutX * 3);
@@ -217,6 +220,13 @@ index a62416c..83b4660 100644
 +			dst[2] = c[fByteComp[2]];
 +			dst += 3;
 +		}
++	}
++	total_abs += mach_absolute_time() - t0;
++	if ((++copies % 200) == 0) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(total_abs / 200, &ns);
++		IOLog("ONCLITE FB: panel copy %llu us average over the last 200 (%llu copies)\n", ns / 1000, copies);
++		total_abs = 0;
 +	}
 +}
 +
@@ -286,7 +296,7 @@ index a62416c..83b4660 100644
  class IOMobileFramebufferUserClient : public IOUserClient {
  	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
  
-@@ -157,11 +399,18 @@ AppleCLCD::start(IOService *provider)
+@@ -157,11 +409,18 @@ AppleCLCD::start(IOService *provider)
  	if (!IOService::start(provider)) {
  		return false;
  	}
@@ -305,7 +315,7 @@ index a62416c..83b4660 100644
  	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
  		IOLog("SWEET FB: no boot framebuffer\n");
  		return false;
-@@ -194,15 +443,30 @@ AppleCLCD::start(IOService *provider)
+@@ -194,15 +453,30 @@ AppleCLCD::start(IOService *provider)
  	}
  	uint32_t hz = 10;
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
@@ -340,7 +350,7 @@ index a62416c..83b4660 100644
  	return true;
  }
  
-@@ -225,6 +489,27 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -225,6 +499,27 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
  	}
  	if (fb->fPowerOff) {
@@ -368,7 +378,7 @@ index a62416c..83b4660 100644
  		/* Fade out: halve every channel each vsync, then black, then idle. */
  		uint32_t step = fb->fFadeStep;
  		if (step <= 6) {
-@@ -238,8 +523,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -238,8 +533,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
  				}
  			}
@@ -381,7 +391,7 @@ index a62416c..83b4660 100644
  		return;
  	}
  	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
-@@ -255,8 +543,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -255,8 +553,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	if (rec != NULL) {
  		fb->present(rec);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
@@ -394,7 +404,7 @@ index a62416c..83b4660 100644
  }
  
  void
-@@ -543,6 +834,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -543,6 +844,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  			}
  			IOLockUnlock(fFB->fLock);
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
