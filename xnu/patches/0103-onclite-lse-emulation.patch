@@ -168,10 +168,10 @@ index 2449334..00118b4 100644
   * int _bcopyout(const char *src, char *dst, vm_size_t len)
 diff --git a/osfmk/arm64/onclite_lse.c b/osfmk/arm64/onclite_lse.c
 new file mode 100644
-index 0000000..e39cae0
+index 0000000..2c500d0
 --- /dev/null
 +++ b/osfmk/arm64/onclite_lse.c
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,236 @@
 +/*
 + * onclite: EL0 emulation of the ARMv8.1 LSE atomics (and ARMv8.3 LDAPR).
 + *
@@ -194,6 +194,9 @@ index 0000000..e39cae0
 +#include <pexpert/pexpert.h>
 +#include <machine/atomic.h>
 +#include <sys/errno.h>
++#include <arm/cpu_data_internal.h>
++#include <kern/clock.h>
++#include <kern/cpu_number.h>
 +
 +extern int onclite_copy_cas(user_addr_t user_addr, unsigned int size_log2, uint64_t expected,
 +    uint64_t desired, uint64_t *old);
@@ -357,6 +360,52 @@ index 0000000..e39cae0
 +		    n, proc_selfpid(), (uint64_t)get_saved_state_pc(state) - 4, instr);
 +	}
 +	return TRUE;
++}
++
++/*
++ * One diagnostics line per sampler snapshot (bsd/dev/sweet_sample.c), to
++ * measure instead of guess why userland is slow: core clock (a dependent
++ * add chain, 1 cycle per add on Cortex-A73, against the 19.2 MHz counter),
++ * per-core timer/IRQ/IPI counts, VM page counts, eMMC totals, LSE traps.
++ */
++extern unsigned int vm_page_free_count, vm_page_active_count, vm_page_inactive_count, vm_page_wire_count;
++extern uint32_t c_segment_pages_compressed;
++extern void onclite_emmc_stats(uint64_t *reads, uint64_t *rbytes, uint64_t *writes, uint64_t *wbytes, uint64_t *busy);
++void onclite_diag_print(void);
++
++void
++onclite_diag_print(void)
++{
++	uint64_t x = 0, abs;
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++	int cpu = cpu_number();
++	uint64_t t0 = mach_absolute_time();
++	for (uint64_t i = 0; i < 20000000; i++) {
++		__asm__ volatile ("add %0, %0, #1" : "+r"(x));
++	}
++	abs = mach_absolute_time() - t0;
++	ml_set_interrupts_enabled(istate);
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	printf("DIAG cpu%d clock ~%llu MHz (20M adds in %llu us); LSE emulated %llu\n",
++	    cpu, ns ? 20000000ULL * 1000ULL / ns : 0, ns / 1000, onclite_lse_emulated());
++	for (unsigned int i = 0; i < MAX_CPUS; i++) {
++		cpu_data_t *cdp = cpu_datap((int)i);
++		if (cdp == NULL) {
++			continue;
++		}
++		printf("DIAG cpu%u timer %llu irq %llu ipi %llu\n", i, cdp->cpu_stat.timer_cnt,
++		    cdp->cpu_stat.irq_ex_cnt, cdp->cpu_stat.ipi_cnt);
++	}
++	printf("DIAG vm pages free %u active %u inactive %u wired %u compressed %u (16K pages)\n",
++	    vm_page_free_count, vm_page_active_count, vm_page_inactive_count, vm_page_wire_count,
++	    c_segment_pages_compressed);
++	uint64_t r, rb, w, wb, busy, busy_ns;
++	onclite_emmc_stats(&r, &rb, &w, &wb, &busy);
++	absolutetime_to_nanoseconds(busy, &busy_ns);
++	printf("DIAG emmc reads %llu (%llu KiB) writes %llu (%llu KiB) busy %llu ms -> %llu KiB/s while busy\n",
++	    r, rb >> 10, w, wb >> 10, busy_ns / 1000000,
++	    busy_ns ? (rb + wb) * 1000000000ULL / busy_ns / 1024 : 0);
 +}
 +#endif /* ONCLITE */
 diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c

@@ -13,10 +13,10 @@ index 6630131..02a6172 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/onclite_emmc.c b/bsd/dev/onclite_emmc.c
 new file mode 100644
-index 0000000..bfaa1c1
+index 0000000..e28cef7
 --- /dev/null
 +++ b/bsd/dev/onclite_emmc.c
-@@ -0,0 +1,1152 @@
+@@ -0,0 +1,1177 @@
 +/*
 + * onclite internal eMMC root device.
 + *
@@ -890,6 +890,22 @@ index 0000000..bfaa1c1
 +	return 0;
 +}
 +
++/* I/O totals for the diagnostics line (osfmk/arm64/onclite_lse.c onclite_diag_print). */
++static struct {
++	uint64_t reads, writes, rbytes, wbytes, busy;   /* busy: mach time holding the card */
++} emmc_stats;
++
++void onclite_emmc_stats(uint64_t *reads, uint64_t *rbytes, uint64_t *writes, uint64_t *wbytes, uint64_t *busy);
++void
++onclite_emmc_stats(uint64_t *reads, uint64_t *rbytes, uint64_t *writes, uint64_t *wbytes, uint64_t *busy)
++{
++	*reads = emmc_stats.reads;
++	*rbytes = emmc_stats.rbytes;
++	*writes = emmc_stats.writes;
++	*wbytes = emmc_stats.wbytes;
++	*busy = emmc_stats.busy;
++}
++
 +static void
 +onclite_emmc_strategy(buf_t bp)
 +{
@@ -919,6 +935,7 @@ index 0000000..bfaa1c1
 +	}
 +
 +	lck_mtx_lock(&onclite_emmc_lock);
++	uint64_t t0 = mach_absolute_time();
 +	for (uint32_t done = 0; done < count;) {
 +		uint64_t pos = off + done;
 +		uint64_t lba = pos / EMMC_BLOCK;
@@ -946,6 +963,14 @@ index 0000000..bfaa1c1
 +		}
 +		done += want;
 +		buf_setresid(bp, count - done);
++	}
++	emmc_stats.busy += mach_absolute_time() - t0;
++	if (rd) {
++		emmc_stats.reads++;
++		emmc_stats.rbytes += count - buf_resid(bp);
++	} else {
++		emmc_stats.writes++;
++		emmc_stats.wbytes += count - buf_resid(bp);
 +	}
 +	lck_mtx_unlock(&onclite_emmc_lock);
 +	buf_unmap(bp);

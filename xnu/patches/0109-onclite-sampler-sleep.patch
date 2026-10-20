@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
-index b40eccd..27a14ee 100644
+index b40eccd..6a11bf3 100644
 --- a/bsd/dev/sweet_sample.c
 +++ b/bsd/dev/sweet_sample.c
 @@ -18,11 +18,16 @@
@@ -15,12 +15,12 @@ index b40eccd..27a14ee 100644
  extern void sweet_sample_start(void);
 +#include <pexpert/arm64/board_config.h>
 +#if defined(ONCLITE)
-+extern uint64_t onclite_lse_emulated(void);    /* osfmk/arm64/onclite_lse.c */
++extern void onclite_diag_print(void);           /* osfmk/arm64/onclite_lse.c */
 +#endif
  
  static char sweet_sample_names[128];
  
-@@ -60,21 +65,40 @@ sweet_sample_proc(proc_t p, __unused void *arg)
+@@ -60,21 +65,41 @@ sweet_sample_proc(proc_t p, __unused void *arg)
  	return PROC_RETURNED;
  }
  
@@ -54,7 +54,8 @@ index b40eccd..27a14ee 100644
 +	sweet_sample_sleep(90);
  	for (int i = 0; i < 40; i++) {
 +#if defined(ONCLITE)
-+		printf("SMP --- sample %d (LSE emulated so far: %llu)\n", i, onclite_lse_emulated());
++		printf("SMP --- sample %d\n", i);
++		onclite_diag_print();
 +#else
  		printf("SMP --- sample %d\n", i);
 +#endif
