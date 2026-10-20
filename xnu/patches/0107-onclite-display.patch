@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index a62416c..93b7cab 100644
+index a62416c..3f17510 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -25,10 +25,18 @@
@@ -46,16 +46,19 @@ index a62416c..93b7cab 100644
  
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
-@@ -82,6 +107,8 @@ enum {
+@@ -82,6 +107,11 @@ enum {
  #define SWEET_FB_LOGICAL_H              2436
  #define SWEET_FB_FORMAT_BGRA            0x42475241
  
++/* Canvas mapping for the USB screenshot responder (bsd/dev/sweet_usb.c). */
++extern "C" { vm_offset_t onclite_canvas_va; uint32_t onclite_canvas_bytes; }
++
 +#define ONC_DSI0_PA                     0x01a94000UL    /* live DT mdss_dsi_ctrl0 dsi_ctrl */
 +
  class IOMobileFramebuffer : public IOService {
  	OSDeclareDefaultStructors(IOMobileFramebuffer);
  };
-@@ -114,8 +141,26 @@ public:
+@@ -114,8 +144,26 @@ public:
  	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
  	bool          fDirty;
  	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
@@ -82,7 +85,7 @@ index a62416c..93b7cab 100644
  
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
  	void addClient(IOMobileFramebufferUserClient *client);
-@@ -126,6 +171,213 @@ public:
+@@ -126,6 +174,213 @@ public:
  
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
  
@@ -296,7 +299,7 @@ index a62416c..93b7cab 100644
  class IOMobileFramebufferUserClient : public IOUserClient {
  	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
  
-@@ -157,11 +409,18 @@ AppleCLCD::start(IOService *provider)
+@@ -157,11 +412,18 @@ AppleCLCD::start(IOService *provider)
  	if (!IOService::start(provider)) {
  		return false;
  	}
@@ -315,7 +318,18 @@ index a62416c..93b7cab 100644
  	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
  		IOLog("SWEET FB: no boot framebuffer\n");
  		return false;
-@@ -194,15 +453,30 @@ AppleCLCD::start(IOService *provider)
+@@ -180,6 +442,10 @@ AppleCLCD::start(IOService *provider)
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++#if defined(ONCLITE)
++	onclite_canvas_bytes = fRowBytes * fHeight;
++	onclite_canvas_va = fPixels;
++#endif
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+@@ -194,15 +460,30 @@ AppleCLCD::start(IOService *provider)
  	}
  	uint32_t hz = 10;
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
@@ -350,7 +364,7 @@ index a62416c..93b7cab 100644
  	return true;
  }
  
-@@ -225,6 +499,27 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -225,6 +506,27 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
  	}
  	if (fb->fPowerOff) {
@@ -378,7 +392,7 @@ index a62416c..93b7cab 100644
  		/* Fade out: halve every channel each vsync, then black, then idle. */
  		uint32_t step = fb->fFadeStep;
  		if (step <= 6) {
-@@ -238,8 +533,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -238,8 +540,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
  				}
  			}
@@ -391,7 +405,7 @@ index a62416c..93b7cab 100644
  		return;
  	}
  	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
-@@ -255,8 +553,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -255,8 +560,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	if (rec != NULL) {
  		fb->present(rec);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
@@ -404,7 +418,7 @@ index a62416c..93b7cab 100644
  }
  
  void
-@@ -543,6 +844,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -543,6 +851,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  			}
  			IOLockUnlock(fFB->fLock);
  			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
