@@ -1,9 +1,9 @@
 diff --git a/bsd/dev/onclite_rpm.c b/bsd/dev/onclite_rpm.c
 new file mode 100644
-index 0000000..42af282
+index 0000000..6006ba9
 --- /dev/null
 +++ b/bsd/dev/onclite_rpm.c
-@@ -0,0 +1,780 @@
+@@ -0,0 +1,783 @@
 +
 +/*
 + * Copyright (c) 2026
@@ -37,11 +37,14 @@ index 0000000..42af282
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +
 +/*
-+ * Keep this disabled for the initial diagnostic boot.
-+ * Set to 1 only after validating all Phase A output and MMIO attributes.
++ * Phase A was validated on the device (H6c, 2026-10-20): SMEM version 11,
++ * rpm_requests cid 4 flags 0x20f, info in msg RAM (88 B), FIFO 2 x 1024,
++ * tx CLOSED / rx CLOSING after LK, and LK's own ldoa requests and their
++ * "msg#" ACKs (length in the first SMD header word) in the FIFOs.
++ * Build with -DONCLITE_RPM_ENABLE_WRITES=0 for a read-only diagnostic.
 + */
 +#ifndef ONCLITE_RPM_ENABLE_WRITES
-+#define ONCLITE_RPM_ENABLE_WRITES 0
++#define ONCLITE_RPM_ENABLE_WRITES 1
 +#endif
 +
 +#define RPM_SMEM_BASE          0x86300000ULL
