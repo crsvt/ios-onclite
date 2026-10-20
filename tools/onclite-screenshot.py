@@ -61,9 +61,17 @@ def main():
     sock.settimeout(0.5)
     buf = bytearray(TOTAL)
     have, frame = set(), [None]
-    sock.sendto(b'SHOT', PHONE)
-    receive(sock, buf, have, frame, time.time() + 5)
     want = set(range(0, TOTAL, CHUNK))
+    # Ask in blocks: one 10.5 MiB burst overruns the USB link and the host
+    # socket (only ~25 % arrived). Block 0 starts a new frame on the phone.
+    BLOCK = 128 * CHUNK
+    for start in range(0, TOTAL, BLOCK):
+        end = min(start + BLOCK, TOTAL)
+        for _ in range(4):
+            sock.sendto(b'SHOT' + struct.pack('<II', start, end), PHONE)
+            receive(sock, buf, have, frame, time.time() + 1.5)
+            if all(o in have for o in range(start, end, CHUNK)):
+                break
     for _ in range(20):
         missing = sorted(want - have)
         if not missing:
