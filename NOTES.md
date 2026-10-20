@@ -255,6 +255,12 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   owner EE 4) and L6 ON -> touch needs an RPM vote (`.claude/research/rpm-l10-report.md`); USB GDSC + all USB clocks
   off on a normal boot (live log needs `fastboot boot`). DIAG then panicked (my bug: cpu_datap past
   ml_get_max_cpu_number; fixed, CI pushed).
+- **H2 (06:16 IST, kernel 19 + shim e7de3d5 = Gold mux to GPLL0 800 MHz, `logs/xnu-h2-goldclk.txt`):** shim log
+  before: Gold mux cfg 0x0 (source XO, confirms 19.2 MHz), cbcr 0x80000000 (off), Gold PLL mode 0 / L 0 (off),
+  GPLL0 mode 0xc0118000 (active), APC SAW version 0x40010000, SAW vlevel 0x0 (?), speed-bin fuse 0x624
+  (bits[10:8] = 6). After: cfg 0x401, cbcr 0x1. XNU then ran much faster, but eMMC init failed: `CMD6 arg 0x3b70200
+  failed (60): status 0x0` right after CMD7 -> no root -> panic -> PS_HOLD restart to TWRP. Fix (pushed): 100 us gaps
+  between ARGUMENT/TRANSFER_MODE/COMMAND writes while the card clock is < 1 MHz, 2 ms after CMD7.
 - **0108 touch (`bsd/dev/onclite_touch.c`, CI 39332051381):** FT5446 @0x38 on BLSP1 QUP3 0x78b7000, polled FIFO
   transfers with V2 tags, GCC BLSP1 AHB vote + QUP3 RCG XO/1 + CBCR, GPIO10/11 func 2, reset GPIO64, chip ID
   0xA3/0x9F, report reg 0x00 every 10 ms, panel 720x1520 -> canvas -> sweet 1080x2400 coordinates for
