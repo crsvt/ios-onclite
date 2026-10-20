@@ -168,7 +168,7 @@ index 2449334..00118b4 100644
   * int _bcopyout(const char *src, char *dst, vm_size_t len)
 diff --git a/osfmk/arm64/onclite_lse.c b/osfmk/arm64/onclite_lse.c
 new file mode 100644
-index 0000000..2c500d0
+index 0000000..88883d5
 --- /dev/null
 +++ b/osfmk/arm64/onclite_lse.c
 @@ -0,0 +1,236 @@
@@ -389,12 +389,12 @@ index 0000000..2c500d0
 +	absolutetime_to_nanoseconds(abs, &ns);
 +	printf("DIAG cpu%d clock ~%llu MHz (20M adds in %llu us); LSE emulated %llu\n",
 +	    cpu, ns ? 20000000ULL * 1000ULL / ns : 0, ns / 1000, onclite_lse_emulated());
-+	for (unsigned int i = 0; i < MAX_CPUS; i++) {
-+		cpu_data_t *cdp = cpu_datap((int)i);
++	for (int i = 0; i <= ml_get_max_cpu_number(); i++) {
++		cpu_data_t *cdp = cpu_datap(i);
 +		if (cdp == NULL) {
 +			continue;
 +		}
-+		printf("DIAG cpu%u timer %llu irq %llu ipi %llu\n", i, cdp->cpu_stat.timer_cnt,
++		printf("DIAG cpu%d timer %llu irq %llu ipi %llu\n", i, cdp->cpu_stat.timer_cnt,
 +		    cdp->cpu_stat.irq_ex_cnt, cdp->cpu_stat.ipi_cnt);
 +	}
 +	printf("DIAG vm pages free %u active %u inactive %u wired %u compressed %u (16K pages)\n",
