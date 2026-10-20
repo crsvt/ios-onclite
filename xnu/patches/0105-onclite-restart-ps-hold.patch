@@ -1,8 +1,8 @@
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..1e49e07 100644
+index 0631685..26584fa 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -10,6 +10,260 @@
+@@ -10,6 +10,262 @@
  #include <IOKit/IODeviceTreeSupport.h>
  #include <IOKit/IOLib.h>
  
@@ -164,6 +164,8 @@ index 0631685..1e49e07 100644
 +		{ "L6", 0x145 }, { "L10", 0x149 },
 +		/* USB QUSB2 PHY supplies (DT vdd / vdda18 / vdda33) */
 +		{ "L3", 0x143 }, { "L7", 0x147 }, { "L13", 0x14d },
++		/* VDD_APC (CPU clusters + CCI), before raising the Gold clock above 800 MHz */
++		{ "S5", 0x120 },
 +	};
 +	vm_offset_t core = ml_io_map(SPMI_CORE_PA, 0x1000);
 +	vm_offset_t cnfg = ml_io_map(SPMI_CNFG_PA, 0x1000);
@@ -263,7 +265,7 @@ index 0631685..1e49e07 100644
  class SweetPlatformExpert : public IODTPlatformExpert {
  	OSDeclareDefaultStructors(SweetPlatformExpert);
  
-@@ -31,6 +285,31 @@ SweetPlatformExpert::start(IOService *provider)
+@@ -31,6 +287,31 @@ SweetPlatformExpert::start(IOService *provider)
  	}
  	registerService();
  	IOLog("SWEET: platform expert registered\n");

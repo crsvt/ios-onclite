@@ -1,5 +1,5 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index a62416c..e9bee21 100644
+index a62416c..42144a9 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -25,10 +25,18 @@
@@ -244,7 +244,35 @@ index a62416c..e9bee21 100644
  	return true;
  }
  
-@@ -238,8 +413,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -225,6 +400,27 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fPowerOff) {
++#if defined(ONCLITE)
++		/*
++		 * Black at once: the 6-step fade of the 1125x2436 canvas plus a
++		 * panel copy per step took seconds at 800 MHz (H7). Only the panel
++		 * is cleared; the canvas keeps the frame, and display on redraws
++		 * the latest swap (fDirty).
++		 */
++		bool blank = fb->fFadeStep == 0;
++		fb->fFadeStep = 1;
++		IOLockUnlock(fb->fLock);
++		if (blank && fb->fPanel != 0) {
++			for (uint32_t y = 0; y < fb->fPanelH; y++) {
++				volatile uint64_t *row = (volatile uint64_t *)(fb->fPanel + (uint64_t)y * fb->fPanelStride);
++				for (uint32_t x = 0; x < fb->fPanelW * 3 / 8; x++) {
++					row[x] = 0;
++				}
++			}
++		}
++		sender->setTimeoutUS(fb->fVsyncUS);
++		return;
++#endif
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+ 		if (step <= 6) {
+@@ -238,8 +434,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
  				}
  			}
@@ -257,7 +285,7 @@ index a62416c..e9bee21 100644
  		return;
  	}
  	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
-@@ -255,8 +433,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -255,8 +454,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	if (rec != NULL) {
  		fb->present(rec);
  		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
