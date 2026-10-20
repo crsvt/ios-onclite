@@ -233,6 +233,20 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   0x0d1300c8, err ENXIO) -> L10 power suspected. Before: GPIO64 reset was output LOW (cfg 0x2c0), GPIO10/11 func 0.
 - **F2 (04:23 IST, kernel 15, 2700 s timer, sweetsample=SpringBoard,lsd,installd):** let lsd finish once.
 - CI 964ade0 (building): read-only PM8953 L6/L10 report at boot (`ONCLITE: PMIC L10 ... -> ON/OFF`).
+- **F2 (manual TWRP at 04:35, `logs/xnu-f2-lsd.txt`, 1672 lines):** lsd is WORKING, not stuck: worker thread in
+  -[MIFilesystemScanner _scanAppsDirectory:] -> MIBundle init/validate -> MILoadInfoPlist (different app per sample);
+  other lsd threads wait in `___LAUNCH_SERVICES_CLIENTS_ARE_WAITING_FOR_THE_DATABASE_TO_FINISH_SEEDING__`. installd never ran.
+- **Siblings (`.claude/research/siblings-report.md`, clones in `.claude/research/siblings/`):** topaz (SM6225, ARMv8.0
+  A73, same root scripts byte-identical to ours) reaches the lock screen in ~3 min with only its 0080-0082 (ARMv8.0
+  build, LSE emulation, gold-only boot), all of which we have. Its later 0094 = Gold cpufreq max via cpufreq-hw (SM6225
+  only; SDM632 needs its own clock/CPR path), 66ae4bf = timer PPIs on secondaries (we enable per core in pe_fiq.c).
+  Their XNU has 4 GiB RAM; ours 1.7 GiB (phone 3 GB: <0x40000000 1G> <0x80000000 2G>, carve-outs 0x80000000-0x90000000,
+  largest contiguous = 0x90000000-0x100000000).
+- **USB live log (0110, kernel out-onclite-17):** sweet_usb.c ported (DWC3 0x7000000, QSCRATCH 0x70f8800, QUSB2 0x79000,
+  GCC USB30 0x3f0xx), boot-arg sweetusb=2, host `tools/onclite-usbnet-mac.sh`. Probably needs `fastboot boot` (LK powers
+  USB only in fastboot mode). G1 attempt at ~05:00 IST: phone not seen on USB at all afterwards; state unknown.
+- **DIAG kernel (CI 01baf95):** every sampler snapshot prints `DIAG cpuN clock ~MHz`, per-core timer/irq/ipi counts,
+  VM free/active/inactive/wired/compressed pages, eMMC reads/writes/KiB/busy ms/KiB/s, LSE count. Next run: measure.
 - **0108 touch (`bsd/dev/onclite_touch.c`, CI 39332051381):** FT5446 @0x38 on BLSP1 QUP3 0x78b7000, polled FIFO
   transfers with V2 tags, GCC BLSP1 AHB vote + QUP3 RCG XO/1 + CBCR, GPIO10/11 func 2, reset GPIO64, chip ID
   0xA3/0x9F, report reg 0x00 every 10 ms, panel 720x1520 -> canvas -> sweet 1080x2400 coordinates for
