@@ -288,6 +288,19 @@ User (2026-10-19): `fastboot reboot recovery` does not work on this device. Get 
   tx CLOSED (head=tail=0xc0), rx CLOSING (head=tail=0x50). LK's requests in tx (len 0x4c: req/56/id/set0/ldoa 6/
   swen 1/uv 1800000/ma 100) and RPM ACKs in rx (len 0x14: req/12/msg#/4/id). Goodix 0x14 NACK, FT5446 0x38 NACK.
   -> writes enabled (0b43de9) for H7.
+- **🎉 H7 (08:09, kernel 24, `logs/xnu-h7-rpm.txt`): TOUCH WORKS.** `ONCLITE RPM: ACK msg=0x5001`, `0x5002`, `LDO10
+  votes acknowledged`; FT5446 chip id 54:22 firmware 0x16, 9 points. User: touch works but slow/laggy, Settings opens
+  and lags, About does not open, background white/odd, power-button fade slow. Log: ~3900 rejected touch frames
+  (`report err 5`, idle 0xff frames); CRASH PosterBoard sig 5 in -[PBFPosterExtensionDataStore
+  _stateLock_setupSwitcherConfigurationForFirstTime] (wallpaper/poster setup -> odd background); assetsd sig 6,
+  mediaserverd x2.
+- Fixes for H8 (kernel 25 = CI 074965a): touch 0xff frame = release, skip repeated slots, clamp edges, INT(GPIO65)-
+  gated polling (after ios-topaz 86b78f5/cd3c6c6/58bd4dd); instant black on display off; S5 (VDD_APC) and USB PHY
+  L3/L7/L13 in the PMIC report; USB power-up port (sweetusb=2, experimental, not enabled in H8); ADT /chosen
+  mac-address-wifi0/bluetooth0 (cherry-picked from ry-diffusion/ios-beryllium ae85413, author kept: 68336b3).
+  H8 boot-args: sweetfb_hz=20, onclite_reboot_after=1800.
+- Open: PosterBoard first-time setup trap (wallpaper), About page (MobileGestalt, maybe fixed by the MACs), AppOS apps
+  not installed (installcoordinationd?), CPU above 800 MHz needs the S5 reading, iOS 16 lag (CPU rendering).
 - **0108 touch (`bsd/dev/onclite_touch.c`, CI 39332051381):** FT5446 @0x38 on BLSP1 QUP3 0x78b7000, polled FIFO
   transfers with V2 tags, GCC BLSP1 AHB vote + QUP3 RCG XO/1 + CBCR, GPIO10/11 func 2, reset GPIO64, chip ID
   0xA3/0x9F, report reg 0x00 every 10 ms, panel 720x1520 -> canvas -> sweet 1080x2400 coordinates for
