@@ -1,9 +1,9 @@
 diff --git a/bsd/dev/onclite_touch.c b/bsd/dev/onclite_touch.c
 new file mode 100644
-index 0000000..ee815f4
+index 0000000..52ef3a8
 --- /dev/null
 +++ b/bsd/dev/onclite_touch.c
-@@ -0,0 +1,488 @@
+@@ -0,0 +1,494 @@
 +/*
 + * onclite touch: FocalTech FT5446 (I2C 0x38) on BLSP1 QUP3 (0x78b7000).
 + *
@@ -41,6 +41,8 @@ index 0000000..ee815f4
 +/* Mach MIG declaration is not included by BSD's exported thread.h. */
 +extern kern_return_t thread_terminate(thread_t);
 +extern void sweet_hid_touch(int finger, int down, int x, int y);
++/* bsd/dev/onclite_rpm.c: RPM vote for PM8953 L10 (touch VDD 2.8 V) */
++extern int onclite_rpm_l10_on(void);
 +void onclite_touch_init(void);
 +
 +#define TOUCH_GCC_PA            0x01800000u
@@ -423,6 +425,10 @@ index 0000000..ee815f4
 +	touch_gpio(GPIO_SDA, 2, 0, 2, false, false);    /* blsp_i2c3, no pull, 2 mA */
 +	touch_gpio(GPIO_SCL, 2, 0, 2, false, false);
 +	touch_gpio(GPIO_INT, 0, 3, 8, false, false);    /* input, pull-up */
++	/* L10 is off after LK (H1): ask the RPM for it before the reset pulse. */
++	int rpm_error = onclite_rpm_l10_on();
++	printf("ONCLITE TOUCH: RPM L10 request -> %d\n", rpm_error);
++	touch_wait(10);
 +	/* focaltech_core.c fts_reset_proc(200): low 20 ms, high, 200 ms */
 +	touch_gpio(GPIO_RESET, 0, 3, 8, true, false);
 +	touch_wait(20);

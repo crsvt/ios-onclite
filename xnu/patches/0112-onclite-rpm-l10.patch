@@ -1,0 +1,786 @@
+diff --git a/bsd/dev/onclite_rpm.c b/bsd/dev/onclite_rpm.c
+new file mode 100644
+index 0000000..42af282
+--- /dev/null
++++ b/bsd/dev/onclite_rpm.c
+@@ -0,0 +1,780 @@
++
++/*
++ * Copyright (c) 2026
++ *
++ * Redmi 7 / Redmi Y3 (onclite) RPM-SMD regulator support.
++ *
++ * This driver inspects the SMEM SMD channel used to communicate with
++ * the Qualcomm Resource Power Manager and prepares a PM8953 LDO10
++ * vote at 2.8 V.
++ *
++ * WARNING:
++ * The SMEM and RPM message RAM mappings must be device/uncached.
++ * Phase A is read-only. Do not enable the write path until its
++ * diagnostics have been validated on the target device.
++ */
++
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ONCLITE)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++
++/*
++ * Integrate with the existing onclite MMIO mapping convention.
++ * The mappings must not be cacheable.
++ */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++/*
++ * Keep this disabled for the initial diagnostic boot.
++ * Set to 1 only after validating all Phase A output and MMIO attributes.
++ */
++#ifndef ONCLITE_RPM_ENABLE_WRITES
++#define ONCLITE_RPM_ENABLE_WRITES 0
++#endif
++
++#define RPM_SMEM_BASE          0x86300000ULL
++#define RPM_SMEM_SIZE          0x00100000U
++#define RPM_MSG_RAM_BASE       0x00060000ULL
++#define RPM_MSG_RAM_SIZE       0x00008000U
++#define RPM_APCS_IPC_BASE      0x0B011008ULL
++
++#define RPM_SMEM_INITIALIZED   0x0C0U
++#define RPM_SMEM_VERSION7      0x05CU
++#define RPM_SMEM_RESERVED      0x0CCU
++#define RPM_SMEM_TOC_BASE      0x0D0U
++
++#define RPM_SMEM_CHANNEL_TBL   13U
++#define RPM_SMEM_CHANNEL_INFO  14U
++#define RPM_SMEM_FIFO_ITEM     338U
++#define RPM_SMEM_TOC_ENTRIES   512U
++#define RPM_SMEM_TOC_ENTRY_SZ  16U
++
++#define RPM_ALLOC_COUNT        64U
++#define RPM_ALLOC_ENTRY_SZ     32U
++#define RPM_ALLOC_NAME_SZ      20U
++#define RPM_ALLOC_EDGE_MASK    0xFFU
++#define RPM_ALLOC_EDGE_APPS    15U
++#define RPM_ALLOC_PACKET       (1U << 9)
++
++#define RPM_CHANNEL_CLOSED     0U
++#define RPM_CHANNEL_OPENING    1U
++#define RPM_CHANNEL_OPENED     2U
++#define RPM_CHANNEL_CLOSING    4U
++
++#define RPM_INFO_WORDS         22U
++#define RPM_INFO_WORD_LAYOUT   88U
++#define RPM_INFO_BYTE_LAYOUT   40U
++
++#define RPM_TX_STATE           0x00U
++#define RPM_TX_DSR             0x04U
++#define RPM_TX_CTS             0x08U
++#define RPM_TX_CD              0x0CU
++#define RPM_TX_RI              0x10U
++#define RPM_TX_FHEAD           0x14U
++#define RPM_TX_FTAIL           0x18U
++#define RPM_TX_FSTATE          0x1CU
++#define RPM_TX_BLOCKREAD       0x20U
++#define RPM_TX_TAIL            0x24U
++#define RPM_TX_HEAD            0x28U
++
++#define RPM_RX_BASE            0x2CU
++#define RPM_RX_STATE           0x2CU
++#define RPM_RX_FHEAD           0x40U
++#define RPM_RX_FSTATE          0x48U
++#define RPM_RX_BLOCKREAD       0x4CU
++#define RPM_RX_TAIL            0x50U
++#define RPM_RX_HEAD            0x54U
++
++#define RPM_SMD_HEADER_SIZE    20U
++#define RPM_REQUEST_SIZE      52U
++#define RPM_PACKET_SIZE       72U
++#define RPM_ACK_TIMEOUT_MS    500U
++#define RPM_OPEN_TIMEOUT_MS   1000U
++
++#define RPM_REQ_MAGIC          0x00716572U
++#define RPM_ACK_MAGIC          0x2367736DU
++#define RPM_RESOURCE_LDOA      0x616F646CU
++#define RPM_KEY_UV             0x00007675U
++#define RPM_KEY_SWEN           0x6E657773U
++#define RPM_L10_UV             2800000U
++
++#define RPM_SET_ACTIVE         0U
++#define RPM_SET_SLEEP          1U
++
++#define RPM_MSG_ACTIVE         0x5001U
++#define RPM_MSG_SLEEP          0x5002U
++
++/*
++ * Explicit LE words: do not depend on compiler struct packing.
++ */
++#define RPM_WORD(a, b, c, d) \
++    ((uint32_t)(a) | ((uint32_t)(b) << 8) | \
++     ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
++
++#define RPM_SMD_MAGIC          RPM_WORD(0x34, 0, 0, 0)
++
++struct rpm_smem_item {
++    uint32_t allocated;
++    uint32_t offset;
++    uint32_t size;
++    uint32_t aux;
++};
++
++struct rpm_alloc_entry {
++    char name[RPM_ALLOC_NAME_SZ];
++    uint32_t cid;
++    uint32_t flags;
++    uint32_t ref_count;
++};
++
++struct rpm_context {
++    volatile uint32_t *smem;
++    volatile uint32_t *msg_ram;
++    volatile uint32_t *ipc;
++
++    volatile uint32_t *info;
++    volatile uint32_t *tx_fifo;
++    volatile uint32_t *rx_fifo;
++
++    uint32_t cid;
++    uint32_t info_size;
++    uint32_t fifo_size;
++    uint32_t fifo_mask;
++    uint32_t tx_fifo_phys;
++    uint32_t rx_fifo_phys;
++};
++
++static int
++rpm_fail(const char *what, uint32_t value)
++{
++    printf("ONCLITE RPM: %s: 0x%08x\n", what, value);
++    return EIO;
++}
++
++static inline uint32_t
++rpm_read(volatile uint32_t *base, uint32_t offset)
++{
++    return base[offset / sizeof(uint32_t)];
++}
++
++static inline void
++rpm_write(volatile uint32_t *base, uint32_t offset, uint32_t value)
++{
++    base[offset / sizeof(uint32_t)] = value;
++}
++
++static inline void
++rpm_dmb(void)
++{
++    __asm__ volatile("dmb osh" ::: "memory");
++}
++
++static inline void
++rpm_dsb(void)
++{
++    __asm__ volatile("dsb osh" ::: "memory");
++}
++
++static inline void
++rpm_kick(struct rpm_context *ctx)
++{
++    rpm_dsb();
++    *ctx->ipc = 1U;
++    rpm_dsb();
++}
++
++static inline int
++rpm_is_power_of_two(uint32_t value)
++{
++    return value >= 128U && (value & (value - 1U)) == 0U;
++}
++
++static inline uint32_t
++rpm_fifo_used(uint32_t head, uint32_t tail, uint32_t mask)
++{
++    return (head - tail) & mask;
++}
++
++static inline uint32_t
++rpm_fifo_read_word(volatile uint32_t *fifo, uint32_t size,
++    uint32_t index)
++{
++    return fifo[(index & (size - 1U)) / sizeof(uint32_t)];
++}
++
++/*
++ * Phase A helper: decode the SMEM item table.
++ * This implementation intentionally accepts only the legacy SMEM
++ * heap (version 11). Version 12 requires global-partition lookup.
++ */
++static int
++rpm_read_item(struct rpm_context *ctx, uint32_t item,
++    struct rpm_smem_item *result)
++{
++    uint32_t toc_offset = RPM_SMEM_TOC_BASE +
++        item * RPM_SMEM_TOC_ENTRY_SZ;
++
++    if (item >= RPM_SMEM_TOC_ENTRIES)
++        return EINVAL;
++
++    result->allocated = rpm_read(ctx->smem, toc_offset);
++    result->offset = rpm_read(ctx->smem, toc_offset + 4U);
++    result->size = rpm_read(ctx->smem, toc_offset + 8U);
++    result->aux = rpm_read(ctx->smem, toc_offset + 12U) & ~3U;
++
++    if (result->allocated == 0U || result->size == 0U)
++        return ENOENT;
++
++    if (result->aux == 0U) {
++        if (result->offset >= RPM_SMEM_SIZE ||
++            result->size > RPM_SMEM_SIZE - result->offset)
++            return EINVAL;
++    } else if (result->aux == RPM_MSG_RAM_BASE) {
++        if (result->offset >= RPM_MSG_RAM_SIZE ||
++            result->size > RPM_MSG_RAM_SIZE - result->offset)
++            return EINVAL;
++    } else {
++        return EINVAL;
++    }
++
++    return 0;
++}
++
++static int
++rpm_resolve_item(struct rpm_context *ctx,
++    const struct rpm_smem_item *item, volatile uint32_t **result)
++{
++    uint64_t phys;
++
++    phys = (item->aux == 0U ? RPM_SMEM_BASE : RPM_MSG_RAM_BASE)
++        + item->offset;
++
++    if ((phys & 3U) != 0U)
++        return EINVAL;
++
++    if (item->aux == 0U) {
++        *result = (volatile uint32_t *)
++            ((uintptr_t)ctx->smem + item->offset);
++    } else {
++        *result = (volatile uint32_t *)
++            ((uintptr_t)ctx->msg_ram + item->offset);
++    }
++
++    return 0;
++}
++
++/*
++ * Strictly read-only Phase A.
++ *
++ * Validates the legacy heap, channel allocation, info layout and FIFO
++ * allocation before returning a context suitable for later operations.
++ */
++static int
++rpm_phase_a(struct rpm_context *ctx)
++{
++    uint32_t initialized, reserved, version;
++    uint32_t i, matches = 0;
++    uint32_t cid = 0, flags = 0, ref_count = 0;
++    struct rpm_smem_item alloc_item, info_item, fifo_item;
++    volatile uint32_t *alloc;
++    uint32_t alloc_words;
++    int error;
++
++    initialized = rpm_read(ctx->smem, RPM_SMEM_INITIALIZED);
++    reserved = rpm_read(ctx->smem, RPM_SMEM_RESERVED);
++    version = rpm_read(ctx->smem, RPM_SMEM_VERSION7);
++
++    printf("ONCLITE RPM: SMEM initialized=%u reserved=0x%08x "
++        "version7=0x%08x\n", initialized, reserved, version);
++
++    if (initialized != 1U)
++        return rpm_fail("SMEM not initialized", initialized);
++
++    if (reserved != 0U)
++        return rpm_fail("SMEM reserved nonzero", reserved);
++
++    if ((version >> 16) != 11U)
++        return rpm_fail("unsupported SMEM version", version);
++
++    error = rpm_read_item(ctx, RPM_SMEM_CHANNEL_TBL, &alloc_item);
++    if (error != 0)
++        return rpm_fail("channel table invalid", error);
++
++    if (alloc_item.aux != 0U ||
++        alloc_item.size < RPM_ALLOC_COUNT * RPM_ALLOC_ENTRY_SZ)
++        return rpm_fail("channel table size/aux invalid",
++            alloc_item.size);
++
++    error = rpm_resolve_item(ctx, &alloc_item, &alloc);
++    if (error != 0)
++        return rpm_fail("channel table mapping invalid", error);
++
++    alloc_words = alloc_item.size / sizeof(uint32_t);
++
++    for (i = 0; i < RPM_ALLOC_COUNT; i++) {
++        uint32_t base = (i * RPM_ALLOC_ENTRY_SZ) / 4U;
++        uint32_t cid_i, flags_i, refs_i;
++        uint32_t name_word0, name_word1, name_word2, name_word3;
++        uint32_t name_word4;
++
++        if (base + RPM_ALLOC_ENTRY_SZ / 4U > alloc_words)
++            return rpm_fail("allocation table truncated", i);
++
++        name_word0 = alloc[base + 0U];
++        name_word1 = alloc[base + 1U];
++        name_word2 = alloc[base + 2U];
++        name_word3 = alloc[base + 3U];
++        name_word4 = alloc[base + 4U];
++
++        cid_i = alloc[base + 5U];
++        flags_i = alloc[base + 6U];
++        refs_i = alloc[base + 7U];
++
++        /*
++         * "rpm_requests" is 12 characters plus NUL. Compare the first
++         * four words exactly, and require the remaining name bytes
++         * through byte 19 to be zero.
++         */
++        if (name_word0 == RPM_WORD('r','p','m','_') &&
++            name_word1 == RPM_WORD('r','e','q','u') &&
++            name_word2 == RPM_WORD('e','s','t','s') &&
++            name_word3 == 0U &&
++            name_word4 == 0U &&
++            refs_i != 0U &&
++            (flags_i & RPM_ALLOC_EDGE_MASK) == RPM_ALLOC_EDGE_APPS &&
++            (flags_i & RPM_ALLOC_PACKET) != 0U) {
++            cid = cid_i;
++            flags = flags_i;
++            ref_count = refs_i;
++            matches++;
++        }
++    }
++
++    if (matches != 1U)
++        return rpm_fail("rpm_requests match count", matches);
++
++    if (cid >= RPM_SMEM_TOC_ENTRIES - RPM_SMEM_CHANNEL_INFO ||
++        cid >= RPM_SMEM_TOC_ENTRIES - RPM_SMEM_FIFO_ITEM)
++        return rpm_fail("channel id out of range", cid);
++
++    printf("ONCLITE RPM: channel cid=%u flags=0x%08x refs=%u\n",
++        cid, flags, ref_count);
++
++    error = rpm_read_item(ctx, RPM_SMEM_CHANNEL_INFO + cid, &info_item);
++    if (error != 0)
++        return rpm_fail("channel info item invalid", error);
++
++    error = rpm_read_item(ctx, RPM_SMEM_FIFO_ITEM + cid, &fifo_item);
++    if (error != 0)
++        return rpm_fail("FIFO item invalid", error);
++
++    /*
++     * The info and FIFO items are expected in RPM message RAM (aux
++     * 0x60000), but SMEM proper (aux 0) is also valid: rpm_read_item()
++     * bounds-checked either region.
++     */
++    printf("ONCLITE RPM: info item aux=0x%x off=0x%x size=%u, "
++        "FIFO item aux=0x%x off=0x%x size=%u\n",
++        info_item.aux, info_item.offset, info_item.size,
++        fifo_item.aux, fifo_item.offset, fifo_item.size);
++
++    if (info_item.size != RPM_INFO_WORD_LAYOUT &&
++        info_item.size != RPM_INFO_BYTE_LAYOUT)
++        return rpm_fail("unsupported channel info layout",
++            info_item.size);
++
++    if (fifo_item.size < 256U || (fifo_item.size & 7U) != 0U)
++        return rpm_fail("FIFO item size invalid", fifo_item.size);
++
++    ctx->info_size = info_item.size;
++    ctx->fifo_size = fifo_item.size / 2U;
++
++    if (!rpm_is_power_of_two(ctx->fifo_size))
++        return rpm_fail("FIFO size not power of two", ctx->fifo_size);
++
++    ctx->fifo_mask = ctx->fifo_size - 1U;
++    ctx->cid = cid;
++
++    error = rpm_resolve_item(ctx, &info_item, &ctx->info);
++    if (error != 0)
++        return rpm_fail("channel info mapping invalid", error);
++
++    error = rpm_resolve_item(ctx, &fifo_item, &ctx->tx_fifo);
++    if (error != 0)
++        return rpm_fail("FIFO mapping invalid", error);
++
++    ctx->rx_fifo = (volatile uint32_t *)
++        ((uintptr_t)ctx->tx_fifo + ctx->fifo_size);
++
++    printf("ONCLITE RPM: info size=%u FIFO half=%u\n",
++        ctx->info_size, ctx->fifo_size);
++
++    /*
++     * Dump channel info as 32-bit words. Byte-layout channels are
++     * diagnostic-only in this implementation and cannot be opened.
++     */
++    for (i = 0; i < ctx->info_size / 4U; i++) {
++        printf("ONCLITE RPM: info[%02u]=0x%08x\n",
++            i, ctx->info[i]);
++    }
++
++    if (ctx->info_size != RPM_INFO_WORD_LAYOUT)
++        return rpm_fail("byte-layout channel is read-only",
++            ctx->info_size);
++
++    /*
++     * Read-only FIFO diagnostic. Do not assume the old data is a
++     * complete packet: the indices are checked again before sending.
++     */
++    for (i = 0; i < 32U; i++) {
++        printf("ONCLITE RPM: FIFO tx[%02u]=0x%08x "
++            "rx[%02u]=0x%08x\n", i,
++            ctx->tx_fifo[i], i, ctx->rx_fifo[i]);
++    }
++
++    return 0;
++}
++
++#if ONCLITE_RPM_ENABLE_WRITES
++
++/*
++ * The write path below is compiled only when the caller explicitly
++ * enables it (ONCLITE_RPM_ENABLE_WRITES).
++ */
++static int
++rpm_open_channel(struct rpm_context *ctx)
++{
++    uint32_t tx_state, rx_state, elapsed;
++
++    tx_state = rpm_read(ctx->info, RPM_TX_STATE);
++    rx_state = rpm_read(ctx->info, RPM_RX_STATE);
++
++    if (tx_state == RPM_CHANNEL_OPENED &&
++        rx_state == RPM_CHANNEL_OPENED) {
++        uint32_t tx_head = rpm_read(ctx->info, RPM_TX_HEAD);
++        uint32_t tx_tail = rpm_read(ctx->info, RPM_TX_TAIL);
++        uint32_t rx_head = rpm_read(ctx->info, RPM_RX_HEAD);
++        uint32_t rx_tail = rpm_read(ctx->info, RPM_RX_TAIL);
++
++        if (rx_head != rx_tail)
++            return rpm_fail("live channel has pending RX data",
++                rx_head - rx_tail);
++
++        printf("ONCLITE RPM: live channel; tx head=%u tail=%u "
++            "rx head=%u tail=%u\n",
++            tx_head, tx_tail, rx_head, rx_tail);
++        return 0;
++    }
++
++    if ((tx_state != RPM_CHANNEL_CLOSED &&
++         tx_state != RPM_CHANNEL_CLOSING) ||
++        (rx_state != RPM_CHANNEL_CLOSED &&
++         rx_state != RPM_CHANNEL_OPENING &&
++         rx_state != RPM_CHANNEL_OPENED &&
++         rx_state != RPM_CHANNEL_CLOSING))
++        return rpm_fail("unsafe SMD state pair",
++            (tx_state << 16) | rx_state);
++
++    /*
++     * Linux-compatible reset sequence. Only write the AP-owned TX
++     * half and RX fields explicitly permitted by the research report.
++     */
++    rpm_write(ctx->info, RPM_TX_DSR, 0U);
++    rpm_write(ctx->info, RPM_TX_CTS, 0U);
++    rpm_write(ctx->info, RPM_TX_CD, 0U);
++    rpm_write(ctx->info, RPM_TX_RI, 0U);
++    rpm_write(ctx->info, RPM_TX_FHEAD, 0U);
++    rpm_write(ctx->info, RPM_TX_FTAIL, 0U);
++    rpm_write(ctx->info, RPM_TX_BLOCKREAD, 1U);
++    rpm_write(ctx->info, RPM_TX_HEAD, 0U);
++    rpm_write(ctx->info, RPM_RX_TAIL, 0U);
++    rpm_write(ctx->info, RPM_TX_STATE, RPM_CHANNEL_CLOSED);
++    rpm_write(ctx->info, RPM_TX_FSTATE, 1U);
++    rpm_dsb();
++    rpm_kick(ctx);
++
++    rpm_write(ctx->info, RPM_TX_DSR, 0U);
++    rpm_write(ctx->info, RPM_TX_CTS, 0U);
++    rpm_write(ctx->info, RPM_TX_CD, 0U);
++    rpm_write(ctx->info, RPM_TX_STATE, RPM_CHANNEL_OPENING);
++    rpm_write(ctx->info, RPM_TX_FSTATE, 1U);
++    rpm_dsb();
++    rpm_kick(ctx);
++
++    for (elapsed = 0; elapsed < RPM_OPEN_TIMEOUT_MS; elapsed++) {
++        rx_state = rpm_read(ctx->info, RPM_RX_STATE);
++
++        if (rx_state == RPM_CHANNEL_OPENING ||
++            rx_state == RPM_CHANNEL_OPENED) {
++            /* Acknowledge the remote state change, as Linux's IRQ path does. */
++            rpm_write(ctx->info, RPM_RX_FSTATE, 0U);
++            break;
++        }
++
++        delay(1000);
++    }
++
++    if (elapsed == RPM_OPEN_TIMEOUT_MS) {
++        rpm_write(ctx->info, RPM_TX_STATE, RPM_CHANNEL_CLOSED);
++        rpm_write(ctx->info, RPM_TX_FSTATE, 1U);
++        rpm_dsb();
++        rpm_kick(ctx);
++        return rpm_fail("timeout waiting for remote OPENING",
++            rx_state);
++    }
++
++    rpm_write(ctx->info, RPM_TX_DSR, 1U);
++    rpm_write(ctx->info, RPM_TX_CTS, 1U);
++    rpm_write(ctx->info, RPM_TX_CD, 1U);
++    rpm_write(ctx->info, RPM_TX_STATE, RPM_CHANNEL_OPENED);
++    rpm_write(ctx->info, RPM_TX_FSTATE, 1U);
++    rpm_dsb();
++    rpm_kick(ctx);
++
++    for (elapsed = 0; elapsed < RPM_OPEN_TIMEOUT_MS; elapsed++) {
++        rx_state = rpm_read(ctx->info, RPM_RX_STATE);
++        if (rx_state == RPM_CHANNEL_OPENED) {
++            rpm_write(ctx->info, RPM_RX_FSTATE, 0U);
++            return 0;
++        }
++        delay(1000);
++    }
++
++    rpm_write(ctx->info, RPM_TX_STATE, RPM_CHANNEL_CLOSED);
++    rpm_write(ctx->info, RPM_TX_FSTATE, 1U);
++    rpm_dsb();
++    rpm_kick(ctx);
++
++    return rpm_fail("timeout waiting for remote OPENED", rx_state);
++}
++
++/*
++ * Build the 72-byte SMD packet as eighteen 32-bit little-endian words.
++ */
++static void
++rpm_build_packet(uint32_t packet[18], uint32_t set, uint32_t msg_id)
++{
++    packet[0]  = RPM_SMD_MAGIC;
++    packet[1]  = 0U;
++    packet[2]  = 0U;
++    packet[3]  = 0U;
++    packet[4]  = 0U;
++
++    packet[5]  = RPM_REQ_MAGIC;
++    packet[6]  = 44U;
++    packet[7]  = msg_id;
++    packet[8]  = set;
++    packet[9]  = RPM_RESOURCE_LDOA;
++    packet[10] = 10U;
++    packet[11] = 24U;
++
++    packet[12] = RPM_KEY_UV;
++    packet[13] = 4U;
++    packet[14] = RPM_L10_UV;
++    packet[15] = RPM_KEY_SWEN;
++    packet[16] = 4U;
++    packet[17] = 1U;
++}
++
++/*
++ * Copy a word-aligned packet into the circular TX FIFO.
++ */
++static int
++rpm_send_packet(struct rpm_context *ctx, const uint32_t packet[18])
++{
++    uint32_t head, tail, used, avail, i;
++
++    head = rpm_read(ctx->info, RPM_TX_HEAD);
++    tail = rpm_read(ctx->info, RPM_TX_TAIL);
++
++    if (head >= ctx->fifo_size || tail >= ctx->fifo_size)
++        return rpm_fail("TX FIFO index out of range", head);
++
++    used = rpm_fifo_used(head, tail, ctx->fifo_mask);
++    avail = ctx->fifo_mask - used;
++
++    if (avail < RPM_PACKET_SIZE)
++        return rpm_fail("TX FIFO lacks space", avail);
++
++    rpm_write(ctx->info, RPM_TX_FTAIL, 0U);
++
++    for (i = 0; i < 18U; i++) {
++        uint32_t index = (head + i * 4U) & ctx->fifo_mask;
++        ctx->tx_fifo[index / 4U] = packet[i];
++    }
++
++    rpm_dmb();
++
++    rpm_write(ctx->info, RPM_TX_HEAD,
++        (head + RPM_PACKET_SIZE) & ctx->fifo_mask);
++    rpm_write(ctx->info, RPM_TX_FHEAD, 1U);
++    rpm_dsb();
++    rpm_kick(ctx);
++
++    return 0;
++}
++
++/*
++ * Consume one ACK or error response. Only the first response packet
++ * is interpreted; malformed responses fail closed.
++ */
++static int
++rpm_wait_ack(struct rpm_context *ctx, uint32_t msg_id)
++{
++    uint32_t elapsed, head, tail, used, len;
++    uint32_t words[64];
++    uint32_t i, count;
++
++    for (elapsed = 0; elapsed < RPM_ACK_TIMEOUT_MS; elapsed++) {
++        head = rpm_read(ctx->info, RPM_RX_HEAD);
++        tail = rpm_read(ctx->info, RPM_RX_TAIL);
++
++        if (head >= ctx->fifo_size || tail >= ctx->fifo_size)
++            return rpm_fail("RX FIFO index out of range", head);
++
++        used = rpm_fifo_used(head, tail, ctx->fifo_mask);
++
++        if (used >= RPM_SMD_HEADER_SIZE)
++            break;
++
++        delay(1000);
++    }
++
++    if (elapsed == RPM_ACK_TIMEOUT_MS)
++        return rpm_fail("ACK timeout", msg_id);
++
++    /*
++     * The packet length is the first word of the 20-byte SMD header
++     * (20 for a plain ACK); the response payload follows the header.
++     */
++    len = rpm_fifo_read_word(ctx->rx_fifo, ctx->fifo_size, tail);
++
++    if ((len & 3U) != 0U || len < 20U || len > sizeof(words))
++        return rpm_fail("invalid RPM response length", len);
++
++    for (elapsed = 0; elapsed < RPM_ACK_TIMEOUT_MS; elapsed++) {
++        head = rpm_read(ctx->info, RPM_RX_HEAD);
++        used = rpm_fifo_used(head, tail, ctx->fifo_mask);
++
++        if (used >= RPM_SMD_HEADER_SIZE + len)
++            break;
++
++        delay(1000);
++    }
++
++    if (elapsed == RPM_ACK_TIMEOUT_MS)
++        return rpm_fail("incomplete RPM response", len);
++
++    count = len / 4U;
++
++    for (i = 0; i < count; i++) {
++        uint32_t index = (tail + RPM_SMD_HEADER_SIZE + i * 4U)
++            & ctx->fifo_mask;
++        words[i] = ctx->rx_fifo[index / 4U];
++    }
++
++    /*
++     * A normal ACK is:
++     * req\0, length 12, msg#, 4, echoed message ID.
++     */
++    if (words[0] != RPM_REQ_MAGIC)
++        return rpm_fail("unexpected RPM response service", words[0]);
++
++    if (words[1] != 12U ||
++        words[2] != RPM_ACK_MAGIC ||
++        words[3] != 4U ||
++        words[4] != msg_id) {
++        return rpm_fail("invalid RPM ACK", words[2]);
++    }
++
++    rpm_write(ctx->info, RPM_RX_TAIL,
++        (tail + RPM_SMD_HEADER_SIZE + len) & ctx->fifo_mask);
++    rpm_write(ctx->info, RPM_RX_FHEAD, 0U);
++    rpm_write(ctx->info, RPM_TX_FTAIL, 1U);
++    rpm_dsb();
++
++    if (rpm_read(ctx->info, RPM_RX_BLOCKREAD) == 0U)
++        rpm_kick(ctx);
++
++    printf("ONCLITE RPM: ACK msg=0x%08x\n", msg_id);
++    return 0;
++}
++
++#endif /* ONCLITE_RPM_ENABLE_WRITES */
++
++/*
++ * Public entry point.
++ *
++ * The first boot is diagnostic-only. After the MMIO mappings and
++ * Phase A output are verified, enable the write path at build time.
++ */
++int
++onclite_rpm_l10_on(void)
++{
++    struct rpm_context ctx;
++    int error;
++
++    bzero(&ctx, sizeof(ctx));
++
++    ctx.smem = (volatile uint32_t *)
++        ml_io_map((vm_offset_t)RPM_SMEM_BASE, RPM_SMEM_SIZE);
++    ctx.msg_ram = (volatile uint32_t *)
++        ml_io_map((vm_offset_t)RPM_MSG_RAM_BASE, RPM_MSG_RAM_SIZE);
++    ctx.ipc = (volatile uint32_t *)
++        ml_io_map((vm_offset_t)RPM_APCS_IPC_BASE, PAGE_SIZE);
++
++    if (ctx.smem == NULL || ctx.msg_ram == NULL || ctx.ipc == NULL) {
++        printf("ONCLITE RPM: MMIO mapping failed\n");
++        return ENXIO;
++    }
++
++    rpm_dmb();
++
++    error = rpm_phase_a(&ctx);
++    if (error != 0)
++        return error;
++
++#if !ONCLITE_RPM_ENABLE_WRITES
++    printf("ONCLITE RPM: diagnostic-only mode; no writes performed\n");
++    return EAGAIN;
++#else
++    {
++        uint32_t packet[18];
++
++        error = rpm_open_channel(&ctx);
++        if (error != 0)
++            return error;
++
++        rpm_build_packet(packet, RPM_SET_ACTIVE, RPM_MSG_ACTIVE);
++
++        error = rpm_send_packet(&ctx, packet);
++        if (error != 0)
++            return error;
++
++        error = rpm_wait_ack(&ctx, RPM_MSG_ACTIVE);
++        if (error != 0)
++            return error;
++
++        rpm_build_packet(packet, RPM_SET_SLEEP, RPM_MSG_SLEEP);
++
++        error = rpm_send_packet(&ctx, packet);
++        if (error != 0)
++            return error;
++
++        error = rpm_wait_ack(&ctx, RPM_MSG_SLEEP);
++        if (error != 0)
++            return error;
++
++        printf("ONCLITE RPM: LDO10 votes acknowledged\n");
++        return 0;
++    }
++#endif
++}
++
++#endif /* ONCLITE */
